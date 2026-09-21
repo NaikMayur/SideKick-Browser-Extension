@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Sidekick</title>
+		<link rel="stylesheet" href="popup.css" />
+	</head>
+	<body>
+		<header class="bar">
+			<div class="brand">
+				<span class="dot" aria-hidden="true"></span>
+				<h1>Sidekick</h1>
+			</div>
+			<div class="bar-actions">
+				<select id="role" aria-label="Filter tools by role"></select>
+				<button id="theme" class="icon-btn" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+			</div>
+		</header>
+
+		<div class="search-row">
+			<div class="search-wrapper">
+				<span class="search-icon" aria-hidden="true">⌕</span>
+				<input id="search" type="search" placeholder="Search 50+ tools… (↑ ↓ to move, Enter to open)" autocomplete="off" aria-label="Search tools" />
+				<span class="search-shortcut" aria-hidden="true">↑ ↓</span>
+			</div>
+		</div>
+
+		<div class="filter-tabs" role="tablist" aria-label="Tool classification">
+			<button id="tab-all" class="tab-btn active" type="button" role="tab" aria-selected="true">All (53)</button>
+			<button id="tab-workflows" class="tab-btn" type="button" role="tab" aria-selected="false">★ Core Workflows</button>
+			<button id="tab-page" class="tab-btn" type="button" role="tab" aria-selected="false">Active Tab</button>
+			<button id="tab-utils" class="tab-btn" type="button" role="tab" aria-selected="false">Utilities</button>
+		</div>
+
+		<main id="main">
+			<section id="list-view">
+				<div id="list" role="listbox" aria-label="Tools"></div>
+				<p id="empty" class="empty" hidden>No tool matches that search.</p>
+			</section>
+
+			<section id="detail-view" hidden>
+				<div class="detail-header-bar">
+					<button id="back" class="detail-back-btn" type="button">← All tools</button>
+					<button id="close-tool" class="detail-close-btn" type="button" title="Close opened tool">✕ Close Tool</button>
+				</div>
+				<h2 id="tool-name"></h2>
+				<p id="tool-desc" class="muted"></p>
+				<form id="form" novalidate></form>
+				<div class="row">
+					<button id="run" class="primary" type="button">Run</button>
+					<button id="copy" type="button">Copy</button>
+					<button id="download" type="button">Save</button>
+					<button id="pin" type="button">Pin</button>
+				</div>
+				<p id="error" class="error" role="alert" hidden></p>
+				<div id="rich-output" class="rich-output" hidden></div>
+				<pre id="output" tabindex="0" aria-live="polite"></pre>
+			</section>
+		</main>
+
+		<footer class="bar footer">
+			<span id="status">Ready</span>
+			<a id="options-link" href="#">Settings &amp; docs</a>
+		</footer>
+
+		<script type="module" src="popup.js"></script>
+	</body>
+</html>

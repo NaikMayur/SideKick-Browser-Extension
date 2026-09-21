@@ -1,0 +1,41 @@
+# Build output & packages
+dist/
+*.zip
+
+# Dependencies
+node_modules/
+
+# Tests (omitted from public distribution)
+test/
+
+# Documentation & internal specifications
+docs/
+AGENTS.md
+PRD.md
+CHANGELOG.md
+*.md
+!README.md
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+*.dockerfile
+
+# Environment & local configurations
+.env
+.env.*
+*.local
+
+# System & temporary files
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace

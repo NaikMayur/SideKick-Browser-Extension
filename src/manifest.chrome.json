@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "Sidekick",
+  "short_name": "Sidekick",
+  "version": "1.0.0",
+  "description": "45 offline tools for developers, testers and designers to inspect, convert, audit and report in every browser.",
+  "minimum_chrome_version": "114",
+  "action": {
+    "default_title": "Sidekick",
+    "default_icon": { "16": "assets/icon-16.png", "48": "assets/icon-48.png", "128": "assets/icon-128.png" }
+  },
+  "icons": { "16": "assets/icon-16.png", "48": "assets/icon-48.png", "128": "assets/icon-128.png" },
+  "background": { "service_worker": "background/service-worker.js", "type": "module" },
+  "devtools_page": "panel/devtools.html",
+  "options_ui": { "page": "options/options.html", "open_in_tab": true },
+  "side_panel": { "default_path": "popup/popup.html" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/content.js"],
+      "css": ["content/overlay.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "commands": {
+    "_execute_action": { "suggested_key": { "default": "Alt+Shift+D" }, "description": "Open Sidekick" },
+    "toggle-grid": { "suggested_key": { "default": "Alt+Shift+G" }, "description": "Toggle layout grid overlay" },
+    "toggle-inspect": { "suggested_key": { "default": "Alt+Shift+I" }, "description": "Toggle element inspector" }
+  },
+  "permissions": ["storage", "activeTab", "scripting", "contextMenus", "clipboardWrite", "downloads", "cookies", "tabs", "unlimitedStorage", "sidePanel"],
+  "optional_permissions": ["webRequest", "bookmarks", "history"],
+  "host_permissions": ["<all_urls>"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}

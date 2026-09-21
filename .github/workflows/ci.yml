@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Lint (static checks, manifest parity, CSP)
+        run: node scripts/lint.mjs
+      - name: Unit tests
+        run: if [ -d "test" ]; then node test/run.mjs; else echo "Tests omitted from public repository"; fi
+      - name: Build all browser targets
+        run: node scripts/build.mjs
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: devkit-builds
+          path: dist/*.zip

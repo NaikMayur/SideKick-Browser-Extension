@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Sidekick settings</title>
+		<link rel="stylesheet" href="../popup/popup.css" />
+		<style>
+			html, body {
+				height: auto;
+				overflow: auto;
+			}
+			body {
+				width: 100%;
+				max-height: none;
+			}
+			.wrap {
+				max-width: 760px;
+				margin: 0 auto;
+				padding: 32px 24px 64px;
+			}
+			section {
+				border: 1px solid var(--border);
+				border-radius: var(--radius);
+				padding: 20px;
+				margin-bottom: 24px;
+			}
+			table {
+				width: 100%;
+				border-collapse: collapse;
+				font-size: 13px;
+			}
+			td,
+			th {
+				border-bottom: 1px solid var(--border);
+				padding: 8px;
+				text-align: left;
+				vertical-align: top;
+			}
+		</style>
+	</head>
+	<body>
+		<div class="wrap">
+			<h1>Sidekick</h1>
+			<p class="muted" id="env">Loading environment…</p>
+
+			<section>
+				<h2>Preferences</h2>
+				<div class="field">
+					<label for="theme">Theme</label>
+					<select id="theme">
+						<option value="system">Match system</option>
+						<option value="light">Light</option>
+						<option value="dark">Dark</option>
+					</select>
+				</div>
+				<div class="field">
+					<label for="role">Default role filter</label>
+					<select id="role"></select>
+				</div>
+				<div class="row">
+					<button id="export" type="button">Export settings &amp; snippets</button>
+					<button id="clear" type="button">Clear all local data</button>
+				</div>
+				<p id="saved" class="muted"></p>
+			</section>
+
+			<section>
+				<h2>Keyboard shortcuts</h2>
+				<table>
+					<tr><th>Alt+Shift+D</th><td>Open Sidekick</td></tr>
+					<tr><th>Alt+Shift+I</th><td>Toggle element inspector</td></tr>
+					<tr><th>Alt+Shift+G</th><td>Toggle layout grid</td></tr>
+					<tr><th>&uarr; &darr; / Enter</th><td>Navigate and open tools from search</td></tr>
+					<tr><th>Ctrl/Cmd+Enter</th><td>Run the open tool</td></tr>
+					<tr><th>Esc</th><td>Back to the tool list</td></tr>
+				</table>
+			</section>
+
+			<section>
+				<h2>Tool catalogue</h2>
+				<p class="muted" id="count"></p>
+				<table id="catalogue"></table>
+			</section>
+
+			<section>
+				<h2>Privacy</h2>
+				<p class="muted">
+					Sidekick runs entirely on your machine. No telemetry, no accounts, no network calls: every tool is pure
+					JavaScript executed in your browser, and settings live in local extension storage only.
+				</p>
+			</section>
+		</div>
+		<script type="module" src="options.js"></script>
+	</body>
+</html>

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Sidekick</title>
+		<link rel="stylesheet" href="../popup/popup.css" />
+		<style>
+			body {
+				width: 100%;
+				max-height: none;
+			}
+			.grid {
+				display: grid;
+				grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+				gap: 8px;
+				padding: 16px 0;
+			}
+		</style>
+	</head>
+	<body>
+		<header class="bar">
+			<div class="brand"><span class="dot"></span><h1>Sidekick</h1></div>
+			<button id="refresh" type="button">Re-run all audits</button>
+		</header>
+		<main>
+			<div class="grid" id="actions"></div>
+			<p id="status" class="muted">Pick an audit to inspect the page in this tab.</p>
+			<pre id="output"></pre>
+		</main>
+		<script type="module" src="panel.js"></script>
+	</body>
+</html>
