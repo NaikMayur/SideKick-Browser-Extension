@@ -4,7 +4,7 @@
 	window.__devkitLoaded = true
 
 	const runtime = typeof browser !== "undefined" && browser.runtime ? browser : chrome
-	const state = { inspect: false, grid: false, outline: false, edit: false, viewport: false }
+	const state = { inspect: false, grid: false, outline: false, edit: false, viewport: false, deviceFrame: null }
 	const LOG_CAP = 300
 	const logBuffer = new Array(LOG_CAP)
 	let logCount = 0
@@ -12,6 +12,7 @@
 	let highlight = null
 	let hud = null
 	let badge = null
+	let deviceSimulator = null
 
 	for (const level of ["error", "warn"]) {
 		const original = console[level].bind(console)
@@ -129,6 +130,7 @@
 			pageStyle.textContent = `
 				.dk-field-filled { outline: 2px solid #3b82f6 !important; outline-offset: 1px !important; }
 				.dk-outline-all *:not(.dk-root):not(.dk-root *) { outline: 1px solid rgba(229, 100, 88, 0.45) !important; }
+				.dk-overflow-culprit { outline: 2px dashed #ef4444 !important; outline-offset: 1px !important; box-shadow: 0 0 10px rgba(239, 68, 68, 0.7) !important; }
 			`
 			;(document.head || document.documentElement).appendChild(pageStyle)
 		}
@@ -304,6 +306,32 @@
 				background-image: linear-gradient(to right, rgba(39, 131, 222, 0.18) 1px, transparent 1px),
 					linear-gradient(to bottom, rgba(39, 131, 222, 0.12) 1px, transparent 1px) !important;
 				background-size: 8px 8px, 8px 8px !important;
+			}
+			.dk-grid-12col {
+				position: fixed !important;
+				inset: 0 !important;
+				width: 100vw !important;
+				height: 100vh !important;
+				z-index: 2147483644 !important;
+				pointer-events: none !important;
+				display: flex !important;
+				justify-content: center !important;
+				padding: 0 24px !important;
+				box-sizing: border-box !important;
+			}
+			.dk-grid-12col-inner {
+				width: 100% !important;
+				max-width: 1280px !important;
+				height: 100% !important;
+				display: grid !important;
+				grid-template-columns: repeat(12, 1fr) !important;
+				gap: 16px !important;
+			}
+			.dk-grid-12col-col {
+				background: rgba(37, 99, 235, 0.08) !important;
+				border-left: 1px solid rgba(37, 99, 235, 0.25) !important;
+				border-right: 1px solid rgba(37, 99, 235, 0.25) !important;
+				height: 100% !important;
 			}
 			.dk-drawer-overlay {
 				position: fixed !important;
@@ -567,7 +595,7 @@
 	}
 
 	let floatingCta = null
-	function showFloatingCta(title, info, onClose) {
+	function showFloatingCta(title, info, onClose, extraActions = null) {
 		ensureStyles()
 		hideFloatingCta()
 		floatingCta = el("div", "dk-floating-cta-bar dk-root")
@@ -594,6 +622,51 @@
 		} else {
 			infoEl.textContent = info || "Active"
 		}
+
+		pill.append(dot, titleEl, infoEl)
+
+		if (Array.isArray(extraActions)) {
+			for (const action of extraActions) {
+				const actionBtn = el("button", "dk-cta-action-btn")
+				actionBtn.type = "button"
+				actionBtn.textContent = action.label
+				actionBtn.title = action.title || ""
+				actionBtn.style.cssText = "background: rgba(59, 130, 246, 0.25) !important; color: #93c5fd !important; border: 1px solid rgba(59, 130, 246, 0.5) !important; border-radius: 9999px !important; padding: 4px 10px !important; font-size: 11px !important; font-weight: 600 !important; cursor: pointer !important; margin-left: 6px !important; transition: all 0.15s ease !important;"
+				actionBtn.addEventListener("click", (e) => {
+					e.preventDefault()
+					e.stopPropagation()
+					action.action?.()
+				})
+				pill.appendChild(actionBtn)
+			}
+		}
+
+		let isMinimized = false
+		const minBtn = el("button", "dk-cta-min-btn")
+		minBtn.type = "button"
+		minBtn.textContent = "—"
+		minBtn.title = "Minimize floating bar (or click again to expand)"
+		minBtn.style.cssText = "background: rgba(255, 255, 255, 0.1) !important; color: #cbd5e1 !important; border: 1px solid rgba(255, 255, 255, 0.2) !important; border-radius: 9999px !important; padding: 4px 8px !important; font-size: 11px !important; font-weight: 700 !important; cursor: pointer !important; margin-left: 6px !important; transition: all 0.15s ease !important;"
+		minBtn.addEventListener("click", (e) => {
+			e.preventDefault()
+			e.stopPropagation()
+			isMinimized = !isMinimized
+			if (isMinimized) {
+				infoEl.style.display = "none"
+				pill.querySelectorAll(".dk-cta-action-btn").forEach((b) => (b.style.display = "none"))
+				closeBtn.style.display = "none"
+				minBtn.textContent = "＋"
+				minBtn.title = "Expand floating bar"
+			} else {
+				infoEl.style.display = ""
+				pill.querySelectorAll(".dk-cta-action-btn").forEach((b) => (b.style.display = ""))
+				closeBtn.style.display = ""
+				minBtn.textContent = "—"
+				minBtn.title = "Minimize floating bar"
+			}
+		})
+		pill.appendChild(minBtn)
+
 		const closeBtn = el("button", "dk-cta-close-btn")
 		closeBtn.type = "button"
 		closeBtn.textContent = "✕ Close Tool"
@@ -604,7 +677,8 @@
 			if (typeof onClose === "function") onClose()
 			hideFloatingCta()
 		})
-		pill.append(dot, titleEl, infoEl, closeBtn)
+		pill.appendChild(closeBtn)
+
 		floatingCta.appendChild(pill)
 		getShadowRoot().appendChild(floatingCta)
 	}
@@ -1852,15 +1926,56 @@
 		}
 	}
 
-	function toggleGrid() {
-		state.grid = !state.grid
-		let grid = document.querySelector(".dk-grid") || getShadowRoot()?.querySelector?.(".dk-grid")
-		if (state.grid && !grid) {
-			grid = el("div", "dk-grid")
+	let gridKeyHandler = null
+	function toggleGrid(switchMode = false) {
+		if (switchMode && state.grid) {
+			state.gridMode = state.gridMode === "12col" ? "8px" : "12col"
+		} else {
+			state.grid = !state.grid
+			if (state.grid && !state.gridMode) state.gridMode = "8px"
+		}
+
+		let grid = getShadowRoot()?.querySelector?.(".dk-grid, .dk-grid-12col")
+		if (grid) grid.remove()
+
+		if (state.grid) {
+			ensureStyles()
+			if (state.gridMode === "12col") {
+				grid = el("div", "dk-grid-12col")
+				const inner = el("div", "dk-grid-12col-inner")
+				for (let i = 0; i < 12; i++) {
+					inner.appendChild(el("div", "dk-grid-12col-col"))
+				}
+				grid.appendChild(inner)
+			} else {
+				grid = el("div", "dk-grid")
+			}
 			getShadowRoot().appendChild(grid)
-			showFloatingCta("Sidekick: Layout Grid", "8px Baseline Grid active", () => toggleGrid())
-		} else if (!state.grid && grid) {
-			grid.remove()
+
+			if (!gridKeyHandler) {
+				gridKeyHandler = (e) => {
+					if ((e.key === "g" || e.key === "G") && !e.ctrlKey && !e.metaKey && !e.altKey && !isDevKitEvent(e)) {
+						const tag = document.activeElement?.tagName?.toLowerCase()
+						if (tag !== "input" && tag !== "textarea" && !document.activeElement?.isContentEditable) {
+							e.preventDefault()
+							toggleGrid(true)
+						}
+					}
+				}
+				window.addEventListener("keydown", gridKeyHandler, true)
+			}
+
+			const label = state.gridMode === "12col" ? "12-Col Responsive Guide" : "8px Baseline Grid"
+			showFloatingCta(
+				"Sidekick: Layout Grid",
+				`${label} active · Press G to toggle mode`,
+				() => toggleGrid(false)
+			)
+		} else {
+			if (gridKeyHandler) {
+				window.removeEventListener("keydown", gridKeyHandler, true)
+				gridKeyHandler = null
+			}
 			hideFloatingCta()
 		}
 		return state.grid
@@ -1871,8 +1986,36 @@
 		ensureStyles()
 		document.documentElement.classList.toggle("dk-outline-all", state.outline)
 		if (state.outline) {
-			showFloatingCta("Sidekick: CSS Outlines", "All DOM elements outlined", () => toggleOutline())
+			const docWidth = document.documentElement.clientWidth || window.innerWidth
+			const culprits = []
+			try {
+				const all = document.querySelectorAll("body *:not(.dk-root):not(.dk-root *)")
+				for (const node of all) {
+					const rect = node.getBoundingClientRect()
+					if (rect.width > 0 && rect.height > 0) {
+						if (rect.right > docWidth + 2 || rect.left < -2) {
+							node.classList.add("dk-overflow-culprit")
+							culprits.push(node)
+						}
+					}
+				}
+			} catch {
+
+			}
+
+			const msg = culprits.length > 0
+				? `All DOM elements outlined · ⚠️ ${culprits.length} overflow culprit${culprits.length === 1 ? "" : "s"} highlighted`
+				: "All DOM elements outlined · No horizontal overflow detected"
+			showFloatingCta("Sidekick: CSS Outlines", msg, () => toggleOutline())
 		} else {
+			try {
+				const prev = document.querySelectorAll(".dk-overflow-culprit")
+				for (const el of prev) {
+					el.classList.remove("dk-overflow-culprit")
+				}
+			} catch {
+
+			}
 			hideFloatingCta()
 		}
 		return state.outline
@@ -2428,7 +2571,14 @@
 		showFloatingCta(
 			"Sidekick: Viewport Sizer",
 			"Live viewport HUD active · Resize browser window to test breakpoints",
-			() => toggleViewport()
+			() => toggleViewport(),
+			[
+				{
+					label: "📱 Simulate Device",
+					title: "Launch in-page device simulator directly on page",
+					action: () => toggleDeviceFrame({ width: 390, height: 844, label: "iPhone 14", icon: "📱" }),
+				},
+			]
 		)
 		return true
 	}
@@ -2485,6 +2635,224 @@
 		} catch {  }
 	}
 
+	const SIMULATOR_PRESETS = [
+		{ label: "iPhone SE", icon: "📱", w: 375, h: 667 },
+		{ label: "iPhone 14", icon: "📱", w: 390, h: 844 },
+		{ label: "iPad Mini", icon: "📱", w: 768, h: 1024 },
+		{ label: "MacBook 13", icon: "💻", w: 1280, h: 800 },
+		{ label: "Full HD", icon: "🖥️", w: 1920, h: 1080 },
+	]
+
+	function toggleDeviceFrame(payload) {
+		if (payload?.close === true || (deviceSimulator && !payload)) {
+			if (deviceSimulator?.parentNode) {
+				deviceSimulator.parentNode.removeChild(deviceSimulator)
+			}
+			deviceSimulator = null
+			state.deviceFrame = null
+			if (badge) badge.style.display = ""
+			hideFloatingCta()
+			try {
+				runtime.runtime.sendMessage({
+					type: "devkit:device-frame-update",
+					payload: { active: false },
+				}).catch(() => {})
+			} catch {}
+			return { active: false }
+		}
+
+		let curW = Math.max(280, Math.round(Number(payload?.width) || 375))
+		let curH = Math.max(200, Math.round(Number(payload?.height) || 667))
+		let curLabel = payload?.label || "Mobile"
+		let curIcon = payload?.icon || "📱"
+		let isLandscape = false
+
+		if (badge) badge.style.display = "none"
+
+		if (deviceSimulator && getShadowRoot()?.contains(deviceSimulator)) {
+			const shell = deviceSimulator.querySelector(".dk-sim-shell")
+			const titleText = deviceSimulator.querySelector(".dk-sim-title")
+			const dimBadge = deviceSimulator.querySelector(".dk-sim-dim-badge")
+			if (shell && titleText && dimBadge) {
+				shell.style.setProperty("width", `${curW}px`, "important")
+				shell.style.setProperty("height", `${curH}px`, "important")
+				shell.style.setProperty("border-radius", curW <= 480 ? "40px" : "24px", "important")
+				const notch = shell.querySelector(".dk-sim-notch")
+				const homeBar = shell.querySelector(".dk-sim-home-bar")
+				if (notch) notch.style.display = curW <= 480 ? "block" : "none"
+				if (homeBar) homeBar.style.display = curW <= 480 ? "block" : "none"
+				titleText.textContent = `${curIcon} ${curLabel}`
+				dimBadge.textContent = `${curW} × ${curH} px`
+				state.deviceFrame = { active: true, width: curW, height: curH, label: curLabel, icon: curIcon, isLandscape: false }
+				showFloatingCta(
+					"Sidekick: Device Simulator",
+					`In-page frame active (${curLabel} ${curW}×${curH})`,
+					() => toggleDeviceFrame({ close: true })
+				)
+				try {
+					runtime.runtime.sendMessage({
+						type: "devkit:device-frame-update",
+						payload: { active: true, width: curW, height: curH, label: curLabel, icon: curIcon },
+					}).catch(() => {})
+				} catch {}
+				return { active: true, width: curW, height: curH, label: curLabel }
+			}
+		}
+
+		ensureStyles()
+		const root = getShadowRoot()
+
+		root.querySelectorAll(".dk-device-sim-overlay").forEach((el) => el.remove())
+
+		const overlay = el("div", "dk-device-sim-overlay")
+		overlay.style.cssText = "position: fixed !important; inset: 0 !important; z-index: 2147483645 !important; background: radial-gradient(circle at 50% 25%, #1e293b 0%, #0b1120 100%) !important; background-image: radial-gradient(rgba(255, 255, 255, 0.08) 1.5px, transparent 1.5px) !important; background-size: 24px 24px !important; overflow: auto !important; padding: 16px 20px 60px 20px !important; pointer-events: auto !important; box-sizing: border-box !important;"
+
+		const inner = el("div", "dk-sim-inner")
+		inner.style.cssText = "display: flex !important; flex-direction: column !important; align-items: center !important; min-width: 100% !important; width: max-content !important; margin: 0 auto !important; box-sizing: border-box !important;"
+
+		const toolbar = el("div", "dk-sim-toolbar")
+		toolbar.style.cssText = "position: sticky !important; top: 0 !important; z-index: 30 !important; display: inline-flex !important; align-items: center !important; gap: 10px !important; background: rgba(15, 23, 42, 0.92) !important; backdrop-filter: blur(16px) !important; -webkit-backdrop-filter: blur(16px) !important; border: 1.5px solid rgba(59, 130, 246, 0.5) !important; border-radius: 9999px !important; padding: 6px 14px !important; box-shadow: 0 12px 30px rgba(0, 0, 0, 0.7), 0 0 20px rgba(59, 130, 246, 0.3) !important; margin-bottom: 20px !important; flex-wrap: wrap !important; justify-content: center !important;"
+
+		const titleText = el("span", "dk-sim-title")
+		titleText.style.cssText = "font-weight: 700 !important; color: #ffffff !important; font-size: 13px !important; display: inline-flex !important; align-items: center !important; gap: 6px !important;"
+		titleText.textContent = `${curIcon} ${curLabel}`
+
+		const dimBadge = el("span", "dk-sim-dim-badge")
+		dimBadge.style.cssText = "font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important; font-size: 11.5px !important; font-weight: 600 !important; color: #93c5fd !important; background: rgba(59, 130, 246, 0.25) !important; border: 1px solid rgba(59, 130, 246, 0.4) !important; padding: 2px 8px !important; border-radius: 9999px !important;"
+		dimBadge.textContent = `${curW} × ${curH} px`
+
+		const rotateBtn = el("button", "dk-sim-btn")
+		rotateBtn.type = "button"
+		rotateBtn.style.cssText = "background: rgba(255, 255, 255, 0.1) !important; border: 1px solid rgba(255, 255, 255, 0.2) !important; border-radius: 9999px !important; color: #ffffff !important; cursor: pointer !important; font-size: 11.5px !important; font-weight: 600 !important; padding: 3px 10px !important; display: inline-flex !important; align-items: center !important; gap: 4px !important; transition: all 0.15s !important;"
+		rotateBtn.textContent = "🔄 Rotate"
+		rotateBtn.title = "Toggle Portrait / Landscape orientation"
+		rotateBtn.addEventListener("click", () => {
+			isLandscape = !isLandscape
+			const temp = curW
+			curW = curH
+			curH = temp
+			shell.style.setProperty("width", `${curW}px`, "important")
+			shell.style.setProperty("height", `${curH}px`, "important")
+			dimBadge.textContent = `${curW} × ${curH} px ${isLandscape ? "(Landscape)" : "(Portrait)"}`
+			state.deviceFrame = { active: true, width: curW, height: curH, label: curLabel, icon: curIcon, isLandscape }
+			try {
+				runtime.runtime.sendMessage({
+					type: "devkit:device-frame-update",
+					payload: { active: true, width: curW, height: curH, label: curLabel, icon: curIcon, isLandscape },
+				}).catch(() => {})
+			} catch {}
+		})
+
+		const presetGroup = el("div", "dk-sim-presets")
+		presetGroup.style.cssText = "display: inline-flex !important; align-items: center !important; gap: 4px !important; border-left: 1px solid rgba(255, 255, 255, 0.2) !important; padding-left: 8px !important;"
+
+		for (const p of SIMULATOR_PRESETS) {
+			const pBtn = el("button", "dk-sim-preset-btn")
+			pBtn.type = "button"
+			pBtn.style.cssText = "background: rgba(255, 255, 255, 0.08) !important; border: 1px solid rgba(255, 255, 255, 0.15) !important; border-radius: 9999px !important; color: #cbd5e1 !important; cursor: pointer !important; font-size: 10.5px !important; font-weight: 500 !important; padding: 2px 7px !important; transition: all 0.15s !important;"
+			pBtn.textContent = p.label
+			pBtn.addEventListener("click", () => {
+				curW = p.w
+				curH = p.h
+				curLabel = p.label
+				curIcon = p.icon
+				isLandscape = false
+				shell.style.setProperty("width", `${curW}px`, "important")
+				shell.style.setProperty("height", `${curH}px`, "important")
+				shell.style.setProperty("border-radius", curW <= 480 ? "40px" : "24px", "important")
+				const notch = shell.querySelector(".dk-sim-notch")
+				const homeBar = shell.querySelector(".dk-sim-home-bar")
+				if (notch) notch.style.display = curW <= 480 ? "block" : "none"
+				if (homeBar) homeBar.style.display = curW <= 480 ? "block" : "none"
+				titleText.textContent = `${curIcon} ${curLabel}`
+				dimBadge.textContent = `${curW} × ${curH} px`
+				state.deviceFrame = { active: true, width: curW, height: curH, label: curLabel, icon: curIcon, isLandscape: false }
+				showFloatingCta(
+					"Sidekick: Device Simulator",
+					`In-page frame active (${curLabel} ${curW}×${curH})`,
+					() => toggleDeviceFrame({ close: true })
+				)
+				try {
+					runtime.runtime.sendMessage({
+						type: "devkit:device-frame-update",
+						payload: { active: true, width: curW, height: curH, label: curLabel, icon: curIcon },
+					}).catch(() => {})
+				} catch {}
+			})
+			presetGroup.appendChild(pBtn)
+		}
+
+		const reloadBtn = el("button", "dk-sim-btn")
+		reloadBtn.type = "button"
+		reloadBtn.style.cssText = "background: rgba(255, 255, 255, 0.1) !important; border: 1px solid rgba(255, 255, 255, 0.2) !important; border-radius: 9999px !important; color: #ffffff !important; cursor: pointer !important; font-size: 11.5px !important; font-weight: 600 !important; padding: 3px 10px !important; display: inline-flex !important; align-items: center !important; gap: 4px !important;"
+		reloadBtn.textContent = "⟳ Reload"
+		reloadBtn.title = "Reload frame content"
+		reloadBtn.addEventListener("click", () => {
+			if (iframe) iframe.src = iframe.src
+		})
+
+		const exitBtn = el("button", "dk-sim-exit")
+		exitBtn.type = "button"
+		exitBtn.style.cssText = "background: rgba(239, 68, 68, 0.25) !important; border: 1px solid rgba(239, 68, 68, 0.5) !important; border-radius: 9999px !important; color: #fca5a5 !important; cursor: pointer !important; font-size: 11.5px !important; font-weight: 700 !important; padding: 3px 12px !important; display: inline-flex !important; align-items: center !important; gap: 4px !important; transition: all 0.15s !important;"
+		exitBtn.textContent = "✕ Exit Frame"
+		exitBtn.addEventListener("click", () => toggleDeviceFrame({ close: true }))
+
+		toolbar.append(titleText, dimBadge, rotateBtn, presetGroup, reloadBtn, exitBtn)
+		inner.appendChild(toolbar)
+
+		const shell = el("div", "dk-sim-shell")
+		shell.style.cssText = `width: ${curW}px !important; height: ${curH}px !important; transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1), height 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important; border: 12px solid #1e293b !important; outline: 2px solid rgba(148, 163, 184, 0.25) !important; border-radius: ${curW <= 480 ? "40px" : "24px"} !important; box-shadow: 0 25px 60px -15px rgba(0, 0, 0, 0.9), 0 0 40px rgba(59, 130, 246, 0.25) !important; background: #ffffff !important; overflow: hidden !important; position: relative !important; flex-shrink: 0 !important;`
+
+		const notch = el("div", "dk-sim-notch")
+		notch.style.cssText = `position: absolute !important; top: 8px !important; left: 50% !important; transform: translateX(-50%) !important; width: 90px !important; height: 18px !important; background: #0b1120 !important; border-radius: 9999px !important; z-index: 10 !important; pointer-events: none !important; display: ${curW <= 480 ? "block" : "none"} !important;`
+		shell.appendChild(notch)
+
+		const homeBar = el("div", "dk-sim-home-bar")
+		homeBar.style.cssText = `position: absolute !important; bottom: 6px !important; left: 50% !important; transform: translateX(-50%) !important; width: 120px !important; height: 4px !important; background: rgba(0, 0, 0, 0.3) !important; border-radius: 9999px !important; z-index: 10 !important; pointer-events: none !important; display: ${curW <= 480 ? "block" : "none"} !important;`
+		shell.appendChild(homeBar)
+
+		const iframe = document.createElement("iframe")
+		iframe.className = "dk-sim-iframe"
+		iframe.src = window.location.href
+		iframe.style.cssText = "width: 100% !important; height: 100% !important; border: none !important; display: block !important; background: #ffffff !important;"
+		shell.appendChild(iframe)
+
+		inner.appendChild(shell)
+
+		const tip = el("div", "dk-sim-tip")
+		tip.style.cssText = "color: #94a3b8 !important; font-size: 11.5px !important; margin-top: 14px !important; text-align: center !important;"
+		tip.textContent = "💡 Tip: Press Esc to exit frame · Scroll inside the device to test responsive layouts"
+		inner.appendChild(tip)
+
+		const onEsc = (e) => {
+			if (e.key === "Escape") {
+				window.removeEventListener("keydown", onEsc)
+				toggleDeviceFrame({ close: true })
+			}
+		}
+		window.addEventListener("keydown", onEsc)
+
+		overlay.appendChild(inner)
+		root.appendChild(overlay)
+		deviceSimulator = overlay
+		state.deviceFrame = { active: true, width: curW, height: curH, label: curLabel, icon: curIcon, isLandscape: false }
+
+		showFloatingCta(
+			"Sidekick: Device Simulator",
+			`In-page frame active (${curLabel} ${curW}×${curH})`,
+			() => toggleDeviceFrame({ close: true })
+		)
+
+		try {
+			runtime.runtime.sendMessage({
+				type: "devkit:device-frame-update",
+				payload: { active: true, width: curW, height: curH, label: curLabel, icon: curIcon },
+			}).catch(() => {})
+		} catch {}
+
+		return { active: true, width: curW, height: curH, label: curLabel }
+	}
+
 	function auditA11y() {
 		const issues = []
 		const add = (severity, rule, message, node) =>
@@ -2539,26 +2907,62 @@
 			null
 		const title = document.title || ""
 		const description = meta("description") || ""
+		const canonical = document.querySelector("link[rel=canonical]")?.href ?? null
+		const robots = meta("robots")
 		const warnings = []
-		if (!title) warnings.push("Missing <title>")
+
+		if (!title) warnings.push("Missing <title> tag")
+		else if (title.length < 15) warnings.push(`Title is too short (${title.length} chars, aim for 30–60)`)
 		else if (title.length > 60) warnings.push(`Title is ${title.length} chars (aim for <= 60)`)
+
 		if (!description) warnings.push("Missing meta description")
+		else if (description.length < 50) warnings.push(`Description is too short (${description.length} chars, aim for 70–160)`)
 		else if (description.length > 160) warnings.push(`Description is ${description.length} chars (aim for <= 160)`)
-		if (!document.querySelector("link[rel=canonical]")) warnings.push("Missing canonical link")
+
+		if (!canonical) warnings.push("Missing canonical link")
+		else if (canonical !== location.href.split("#")[0]) warnings.push("Canonical URL differs from current page URL")
+
+		if (robots && /noindex/i.test(robots)) warnings.push("Page has robots noindex directive (search engines will not index this page)")
+
 		if (!meta("og:title")) warnings.push("Missing og:title")
 		if (!meta("og:image")) warnings.push("Missing og:image")
 		if (!meta("viewport")) warnings.push("Missing viewport meta — page is not mobile ready")
+		if (!document.documentElement.lang) warnings.push("Missing lang attribute on <html> element")
+
+		const h1List = [...document.querySelectorAll("h1")].map((h) => (h.textContent || "").trim()).filter(Boolean)
+		if (h1List.length === 0) warnings.push("Page has no <h1> heading")
+		else if (h1List.length > 1) warnings.push(`Page has multiple (${h1List.length}) <h1> headings (recommended: exactly 1)`)
+
 		const images = [...document.images]
+		const favicon = document.querySelector("link[rel*='icon']")?.href || null
+
 		return {
 			title,
 			titleLength: title.length,
 			description,
-			canonical: document.querySelector("link[rel=canonical]")?.href ?? null,
-			robots: meta("robots"),
+			canonical,
+			robots: robots || "all (index, follow)",
+			isNoIndex: Boolean(robots && /noindex/i.test(robots)),
 			viewport: meta("viewport"),
-			openGraph: { title: meta("og:title"), description: meta("og:description"), image: meta("og:image") },
+			lang: document.documentElement.lang || null,
+			charset: document.characterSet || document.querySelector("meta[charset]")?.getAttribute("charset") || null,
+			favicon,
+			openGraph: {
+				title: meta("og:title") || title,
+				description: meta("og:description") || description,
+				image: meta("og:image"),
+				url: meta("og:url") || canonical || location.href,
+				siteName: meta("og:site_name"),
+			},
+			twitter: {
+				card: meta("twitter:card") || "summary",
+				title: meta("twitter:title") || meta("og:title") || title,
+				description: meta("twitter:description") || meta("og:description") || description,
+				image: meta("twitter:image") || meta("og:image"),
+				site: meta("twitter:site"),
+			},
 			headings: {
-				h1: [...document.querySelectorAll("h1")].map((h) => h.textContent.trim()).slice(0, 10),
+				h1: h1List.slice(0, 10),
 				counts: Object.fromEntries([1, 2, 3, 4, 5, 6].map((n) => [`h${n}`, document.querySelectorAll(`h${n}`).length])),
 			},
 			images: { total: images.length, missingAlt: images.filter((i) => !i.alt).length },
@@ -2573,19 +2977,37 @@
 		const problems = []
 		const checkedUrls = new Set()
 		const brokenLinks = []
+
 		for (const link of links) {
 			const href = link.getAttribute("href")
 			if (href === null || href.trim() === "" || href === "#") {
 				problems.push({ issue: "empty or hash href", selector: cssPath(link), text: (link.textContent || "").trim().slice(0, 40) })
 			} else if (href.startsWith("javascript:")) {
 				problems.push({ issue: "javascript: link", selector: cssPath(link) })
+			} else if (href.startsWith("#") && href.length > 1) {
+				const targetId = href.slice(1)
+				try {
+					if (!document.getElementById(targetId) && !document.querySelector(`[name="${targetId}"]`)) {
+						problems.push({ issue: `Broken in-page anchor (#${targetId})`, selector: cssPath(link), text: (link.textContent || "").trim().slice(0, 40) })
+					}
+				} catch {  }
 			} else if (location.protocol === "https:" && href.startsWith("http:")) {
-				problems.push({ issue: "mixed content link", href, selector: cssPath(link) })
+				problems.push({ issue: "Mixed content link (HTTP on HTTPS)", href, selector: cssPath(link) })
 			}
+
 			if (link.target === "_blank" && !/noopener/.test(link.rel)) {
 				problems.push({ issue: "target=_blank without rel=noopener", selector: cssPath(link) })
 			}
 		}
+
+		if (location.protocol === "https:") {
+			for (const img of document.images) {
+				if (img.src && img.src.startsWith("http:")) {
+					problems.push({ issue: "Mixed content image (HTTP on HTTPS)", href: img.src, selector: cssPath(img) })
+				}
+			}
+		}
+
 		const candidateLinks = links
 			.map((l) => l.href)
 			.filter((h) => h && h.startsWith(location.origin) && !checkedUrls.has(h))
@@ -2597,14 +3019,20 @@
 				if (res && res.status >= 400) {
 					brokenLinks.push({ url, status: res.status, statusText: res.statusText })
 				}
-			} catch {
-
-			}
+			} catch {  }
 		}
+
 		const brokenImages = [...document.images]
 			.filter((img) => img.complete && img.naturalWidth === 0)
 			.map((img) => ({ src: img.currentSrc || img.src, selector: cssPath(img), alt: img.alt || null }))
-		return { links: links.length, images: document.images.length, brokenLinks, brokenImages, problems: problems.slice(0, 200) }
+
+		return {
+			links: links.length,
+			images: document.images.length,
+			brokenLinks,
+			brokenImages,
+			problems: problems.slice(0, 200),
+		}
 	}
 
 	function metrics() {
@@ -2613,9 +3041,12 @@
 		const bytes = resources.reduce((sum, r) => sum + (r.transferSize || 0), 0)
 		const paints = Object.fromEntries(performance.getEntriesByType("paint").map((p) => [p.name, Math.round(p.startTime)]))
 		const byType = {}
+		const bytesByType = {}
+
 		for (const resource of resources) {
 			const key = resource.initiatorType || "other"
 			byType[key] = (byType[key] ?? 0) + 1
+			bytesByType[key] = (bytesByType[key] ?? 0) + (resource.transferSize || 0)
 		}
 
 		let lcp = null
@@ -2638,27 +3069,61 @@
 			if (lt.length) longTasks = { count: lt.length, totalMs: Math.round(lt.reduce((s, t) => s + t.duration, 0)) }
 		} catch {  }
 
+		const ttfb = nav ? Math.round(nav.responseStart) : null
+		const fcp = paints["first-contentful-paint"] || null
+
+		const rate = (val, good, poor) => {
+			if (val === null || val === undefined) return "unknown"
+			if (val <= good) return "good"
+			if (val <= poor) return "needs-improvement"
+			return "poor"
+		}
+
+		const vitals = {
+			ttfb: { value: ttfb, rating: rate(ttfb, 800, 1800), label: "TTFB", unit: "ms" },
+			fcp: { value: fcp, rating: rate(fcp, 1800, 3000), label: "FCP", unit: "ms" },
+			lcp: { value: lcp, rating: rate(lcp, 2500, 4000), label: "LCP", unit: "ms" },
+			cls: { value: cls, rating: rate(cls, 0.1, 0.25), label: "CLS", unit: "" },
+		}
+
 		const largest = [...resources]
 			.filter((r) => r.transferSize > 0)
 			.sort((a, b) => b.transferSize - a.transferSize)
-			.slice(0, 5)
-			.map((r) => ({ name: r.name.split("/").pop().split("?")[0], size: `${Math.round(r.transferSize / 1024)} KB`, type: r.initiatorType }))
+			.slice(0, 8)
+			.map((r) => ({
+				name: r.name.split("/").pop().split("?")[0] || r.name,
+				fullUrl: r.name,
+				size: `${Math.round(r.transferSize / 1024)} KB`,
+				bytes: r.transferSize,
+				type: r.initiatorType,
+			}))
+
+		let memory = null
+		if (performance.memory) {
+			memory = {
+				usedJsHeap: `${Math.round(performance.memory.usedJSHeapSize / 1048576)} MB`,
+				totalJsHeap: `${Math.round(performance.memory.totalJSHeapSize / 1048576)} MB`,
+			}
+		}
 
 		return {
 			url: location.href,
 			readyState: document.readyState,
 			navigationType: nav?.type ?? null,
-			ttfbMs: nav ? Math.round(nav.responseStart) : null,
+			ttfbMs: ttfb,
 			domContentLoadedMs: nav ? Math.round(nav.domContentLoadedEventEnd) : null,
 			loadMs: nav ? Math.round(nav.loadEventEnd) : null,
 			paints,
 			lcpMs: lcp,
 			cls,
+			vitals,
 			longTasks,
+			memory,
 			resourceCount: resources.length,
 			transferBytes: bytes,
 			transferReadable: bytes > 1048576 ? `${Math.round((bytes / 1048576) * 10) / 10} MB` : `${Math.round((bytes / 1024) * 10) / 10} KB`,
 			resourcesByType: byType,
+			bytesByType,
 			largestResources: largest,
 			domNodes: document.getElementsByTagName("*").length,
 			iframes: document.querySelectorAll("iframe").length,
@@ -2668,21 +3133,44 @@
 
 	function storageDump() {
 		const read = (store) => {
-			const out = {}
+			const map = {}
+			const items = []
+			let totalBytes = 0
 			try {
-				for (let i = 0; i < store.length; i += 1) {
-					const key = store.key(i)
-					out[key] = String(store.getItem(key)).slice(0, 500)
+				if (store) {
+					for (let i = 0; i < store.length; i += 1) {
+						const key = store.key(i)
+						const rawVal = store.getItem(key) ?? ""
+						const bytes = (key.length + rawVal.length) * 2
+						totalBytes += bytes
+						map[key] = rawVal.length > 500 ? rawVal.slice(0, 500) + "…" : rawVal
+						items.push({
+							key,
+							value: rawVal.length > 50000 ? rawVal.slice(0, 50000) + "… (truncated)" : rawVal,
+							bytes,
+						})
+					}
 				}
 			} catch (error) {
-				out.__error = error.message
+				map.__error = error.message
 			}
-			return out
+			return { map, items, totalBytes }
 		}
+
+		const cookieStrings = document.cookie ? document.cookie.split(";").map((c) => c.trim()).filter(Boolean) : []
+		const cookieItems = cookieStrings.map((c) => {
+			const eqIdx = c.indexOf("=")
+			if (eqIdx === -1) return { key: c, value: "", bytes: c.length }
+			const key = c.slice(0, eqIdx).trim()
+			const value = c.slice(eqIdx + 1).trim()
+			return { key, value, bytes: c.length }
+		})
+		const totalCookieBytes = cookieItems.reduce((acc, c) => acc + c.bytes, 0)
+
 		return {
 			localStorage: read(window.localStorage),
 			sessionStorage: read(window.sessionStorage),
-			cookies: document.cookie ? document.cookie.split(";").map((c) => c.trim()) : [],
+			cookies: { items: cookieItems, raw: cookieStrings, totalBytes: totalCookieBytes },
 		}
 	}
 
@@ -2989,6 +3477,8 @@
 			scriptList.some((s) => s.includes("astro")) ||
 			document.querySelector("[data-astro-cid], astro-island, astro-slot"),
 		)
+		check("Qwik", () => Boolean(document.querySelector("[q\\:container], [q\\:id]")) || window.qwikevents)
+		check("SvelteKit", () => Boolean(document.querySelector("[data-sveltekit-preload-data]")) || scriptList.some((s) => s.includes("/_app/immutable/")))
 		check("jQuery", () => scriptList.some((s) => s.includes("jquery")) || window.jQuery)
 
 		check("Tailwind CSS", () =>
@@ -3000,11 +3490,16 @@
 		check("Radix UI", () =>
 			Boolean(document.querySelector("[data-radix-collection-item], [data-state][data-orientation], [data-radix-popper-content-wrapper]")),
 		)
+		check("Shadcn UI", () => Boolean(document.querySelector("[data-slot='button'], [data-slot='card'], [data-slot='dialog'], [data-sidebar]")))
 		check("Bootstrap", () =>
 			document.querySelector("[class*='container-fluid'], .navbar, [class*='col-md-']") ||
 			[...document.styleSheets].some((s) => (s.href || "").includes("bootstrap")),
 		)
 		check("Material UI", () => Boolean(document.querySelector("[class*='MuiBox-'], [class*='MuiButton-'], [class*='MuiTypography-']")))
+		check("Chakra UI", () => Boolean(document.querySelector("[class*='chakra-'], .chakra-ui-light, .chakra-ui-dark")))
+		check("Mantine", () => Boolean(document.querySelector("[class*='mantine-']")))
+		check("Ant Design", () => Boolean(document.querySelector("[class*='ant-btn'], [class*='ant-layout'], .ant-menu")))
+		check("Styled Components", () => Boolean(document.querySelector("style[data-styled], [class*='sc-']")))
 		check("Lucide Icons", () => Boolean(document.querySelector("svg.lucide, [class*='lucide-']")))
 		check("Font Awesome", () =>
 			Boolean(document.querySelector("[class*='fa-'], [class*='fas '], [class*='fab '], link[href*='font-awesome']")),
@@ -3012,6 +3507,10 @@
 		check("Framer Motion", () => Boolean(document.querySelector("[data-framer-component-type], [style*='--framer-']")))
 		check("GSAP", () => scriptList.some((s) => s.includes("gsap")) || window.gsap)
 		check("Three.js", () => scriptList.some((s) => s.includes("three")) || window.THREE)
+
+		check("Redux", () => Boolean(window.__REDUX_DEVTOOLS_EXTENSION__ || document.querySelector("[data-redux]")))
+		check("TanStack Query", () => Boolean(window.__REACT_QUERY_DEVTOOLS_GLOBAL_HOOK__) || scriptList.some((s) => s.includes("react-query") || s.includes("tanstack")))
+		check("Apollo GraphQL", () => Boolean(window.__APOLLO_CLIENT__) || scriptList.some((s) => s.includes("apollo")))
 
 		check("Google Tag Manager", () =>
 			scriptList.some((s) => s.includes("googletagmanager.com/gtm.js")) ||
@@ -3037,6 +3536,9 @@
 		check("Hotjar", () => scriptList.some((s) => s.includes("static.hotjar.com")) || window.hj)
 		check("Segment", () => scriptList.some((s) => s.includes("cdn.segment.com")) || window.analytics?.identify)
 		check("PostHog", () => scriptList.some((s) => s.includes("posthog")) || window.posthog)
+		check("Cloudflare Insights", () => Boolean(window.__cfRLUnblockHandlers || domainList.includes("static.cloudflareinsights.com")))
+		check("Vercel Analytics", () => Boolean(window.va || scriptList.some((s) => s.includes("/_vercel/insights"))))
+		check("Microsoft Clarity", () => Boolean(window.clarity || scriptList.some((s) => s.includes("clarity.ms"))))
 
 		check("Clerk", () =>
 			scriptList.some((s) => s.includes("clerk")) ||
@@ -3047,6 +3549,8 @@
 			domainList.includes("js.stripe.com") ||
 			window.Stripe,
 		)
+		check("Supabase", () => domainList.some((d) => d.includes("supabase.co")) || scriptList.some((s) => s.includes("supabase")))
+		check("Firebase", () => Boolean(window.firebase) || domainList.some((d) => d.includes("firebaseapp.com")))
 		check("Tolt", () =>
 			domainList.some((d) => d.includes("tolt.io")) ||
 			scriptList.some((s) => s.includes("tolt")),
@@ -3059,6 +3563,8 @@
 
 		check("WordPress", () => document.querySelector("meta[name='generator'][content*='WordPress']") || window.wp)
 		check("Shopify", () => window.Shopify)
+		check("Webflow", () => Boolean(document.querySelector("html.w-mod-js, [data-w-id]")) || scriptList.some((s) => s.includes("webflow")))
+		check("Squarespace", () => Boolean(window.Static?.SQUARESPACE_CACHE_VERSION || document.querySelector("link[href*='squarespace']")))
 
 		check("Webpack", () =>
 			scriptList.some((s) => s.includes("webpack") || s.includes("chunks/")) ||
@@ -3084,8 +3590,10 @@
 			"Nuxt": { category: "Framework", icon: "▲" },
 			"Angular": { category: "Framework", icon: "🅰" },
 			"Svelte": { category: "Framework", icon: "🔥" },
+			"SvelteKit": { category: "Framework", icon: "🔥" },
 			"Remix": { category: "Framework", icon: "💿" },
 			"Astro": { category: "Framework", icon: "🚀" },
+			"Qwik": { category: "Framework", icon: "⚡" },
 			"Preact": { category: "Framework", icon: "⚛" },
 			"Solid": { category: "Framework", icon: "🔷" },
 			"Lit": { category: "Framework", icon: "🔥" },
@@ -3094,26 +3602,41 @@
 			"jQuery": { category: "Library", icon: "💲" },
 			"Tailwind CSS": { category: "CSS & UI", icon: "🌊" },
 			"Radix UI": { category: "CSS & UI", icon: "🧩" },
+			"Shadcn UI": { category: "CSS & UI", icon: "🖤" },
 			"Bootstrap": { category: "CSS & UI", icon: "🅱" },
 			"Material UI": { category: "CSS & UI", icon: "Ⓜ" },
+			"Chakra UI": { category: "CSS & UI", icon: "⚡" },
+			"Mantine": { category: "CSS & UI", icon: "🔷" },
+			"Ant Design": { category: "CSS & UI", icon: "🐜" },
+			"Styled Components": { category: "CSS & UI", icon: "💅" },
 			"Lucide Icons": { category: "Icons & Media", icon: "✨" },
 			"Font Awesome": { category: "Icons & Media", icon: "🚩" },
 			"Framer Motion": { category: "Animation", icon: "🎬" },
 			"GSAP": { category: "Animation", icon: "🟩" },
 			"Three.js": { category: "3D & Graphics", icon: "🔺" },
+			"Redux": { category: "State Management", icon: "🔄" },
+			"TanStack Query": { category: "State & Data", icon: "📡" },
+			"Apollo GraphQL": { category: "State & Data", icon: "🚀" },
 			"Google Tag Manager": { category: "Analytics & Tagging", icon: "🏷" },
 			"Google Analytics": { category: "Analytics", icon: "📊" },
 			"Meta (Facebook) Pixel": { category: "Advertising", icon: "♾" },
 			"Twitter (X) Ads": { category: "Advertising", icon: "🐦" },
 			"Clerk": { category: "Authentication", icon: "🔐" },
 			"Stripe": { category: "Payments", icon: "💳" },
+			"Supabase": { category: "Backend & DB", icon: "⚡" },
+			"Firebase": { category: "Backend & DB", icon: "🔥" },
 			"Tolt": { category: "Affiliate Tracking", icon: "🤝" },
 			"Sentry": { category: "Monitoring & Errors", icon: "🛡" },
 			"Hotjar": { category: "Analytics & Heatmaps", icon: "🔥" },
 			"Segment": { category: "Customer Data", icon: "🔀" },
 			"PostHog": { category: "Product Analytics", icon: "🦔" },
+			"Cloudflare Insights": { category: "Analytics", icon: "☁️" },
+			"Vercel Analytics": { category: "Analytics", icon: "▲" },
+			"Microsoft Clarity": { category: "Analytics & Heatmaps", icon: "🔍" },
 			"WordPress": { category: "CMS", icon: "📝" },
 			"Shopify": { category: "E-Commerce", icon: "🛍" },
+			"Webflow": { category: "CMS & Builder", icon: "🌐" },
+			"Squarespace": { category: "CMS & Builder", icon: "⬛" },
 			"Webpack": { category: "Build Tools", icon: "📦" },
 			"Vite": { category: "Build Tools", icon: "⚡" },
 			"Turbopack": { category: "Build Tools", icon: "⚡" },
@@ -3349,7 +3872,6 @@
 	}
 
 	function enhancedA11yChecks(issues, add) {
-
 		if (!document.querySelector("main")) add("moderate", "landmark-main", "Page has no <main> landmark")
 		if (!document.querySelector("nav")) add("minor", "landmark-nav", "Page has no <nav> landmark")
 
@@ -3364,6 +3886,41 @@
 			const style = getComputedStyle(el)
 			if (style.outlineStyle === "none" && style.boxShadow === "none") {
 				add("moderate", "focus-visible", "Focused element has no visible focus indicator", el)
+			}
+		}
+
+		for (const iframe of document.querySelectorAll("iframe:not([title])")) {
+			add("serious", "iframe-title", "<iframe> element missing title attribute (WCAG 4.1.2)", iframe)
+		}
+
+		let smallTargetCount = 0
+		for (const btn of document.querySelectorAll("button, a, input[type=checkbox], input[type=radio]")) {
+			const rect = btn.getBoundingClientRect()
+			if (rect.width > 0 && rect.height > 0 && (rect.width < 24 || rect.height < 24)) {
+				add("minor", "target-size", `Target size is small (${Math.round(rect.width)}×${Math.round(rect.height)}px, aim for ≥24×24px)`, btn)
+				smallTargetCount++
+				if (smallTargetCount >= 10) break
+			}
+		}
+
+		for (const img of document.querySelectorAll("img[alt]")) {
+			const alt = img.alt.trim().toLowerCase()
+			if (/^(image|photo|picture|icon|graphic|logo image)$/.test(alt)) {
+				add("minor", "redundant-alt", `Alt text "${img.alt}" is redundant (avoid generic words like "image" or "photo")`, img)
+			}
+		}
+
+		const ids = new Set()
+		let dupCount = 0
+		for (const el of document.querySelectorAll("[id]")) {
+			const id = el.id.trim()
+			if (!id) continue
+			if (ids.has(id)) {
+				add("moderate", "duplicate-id", `Duplicate ID "#${id}" found in DOM`, el)
+				dupCount++
+				if (dupCount >= 5) break
+			} else {
+				ids.add(id)
 			}
 		}
 	}
@@ -4801,6 +5358,7 @@
 		if (state.outline) toggleOutline()
 		if (state.edit) toggleEdit()
 		if (state.viewport) toggleViewport()
+		if (state.deviceFrame) toggleDeviceFrame({ close: true })
 		if (eyedropperActive) stopInPageEyedropper()
 		if (deepInspectPending) {
 			deepInspectPending = false
@@ -4823,8 +5381,31 @@
 		"toggle-outline": () => ({ ok: true, data: { enabled: toggleOutline() } }),
 		"toggle-edit": () => ({ ok: true, data: { enabled: toggleEdit() } }),
 		"edit-reset-all": () => ({ ok: true, data: { count: resetAllMovedElements() } }),
-		viewport: () => ({ ok: true, data: { enabled: toggleViewport(), width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio } }),
+		viewport: (payload) => {
+			let enabled = state.viewport
+			if (payload?.enable === true) {
+				if (!state.viewport) enabled = toggleViewport()
+			} else if (payload?.enable === false) {
+				if (state.viewport) enabled = toggleViewport()
+			} else {
+				enabled = toggleViewport()
+			}
+			return { ok: true, data: { enabled, width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio } }
+		},
 		"viewport-query": () => ({ ok: true, data: { enabled: state.viewport, width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio } }),
+		"device-frame": (payload) => ({ ok: true, data: toggleDeviceFrame(payload) }),
+		"device-frame-query": () => ({ ok: true, data: { active: !!state.deviceFrame, ...state.deviceFrame } }),
+		"active-tools-query": () => ({
+			ok: true,
+			data: {
+				viewport: !!state.viewport,
+				deviceFrame: state.deviceFrame ? { ...state.deviceFrame } : { active: false },
+				inspect: !!state.inspect,
+				edit: !!state.edit,
+				grid: !!state.grid,
+				outline: !!state.outline,
+			},
+		}),
 		eyedropper: () => openEyeDropper(),
 		"start-eyedropper": () => startInPageEyedropper(),
 		"stop-eyedropper": () => {
@@ -4836,10 +5417,23 @@
 		"scan-links": async () => ({ ok: true, data: await scanLinks() }),
 		metrics: () => ({ ok: true, data: metrics() }),
 		storage: () => ({ ok: true, data: storageDump() }),
-		"storage-clear": () => {
-			localStorage.clear()
-			sessionStorage.clear()
-			return { ok: true, data: "Local and session storage cleared" }
+		"storage-clear": (payload) => {
+			const store = payload?.store || "all"
+			if (store === "localStorage" || store === "all") localStorage.clear()
+			if (store === "sessionStorage" || store === "all") sessionStorage.clear()
+			return { ok: true, data: storageDump() }
+		},
+		"storage-remove-key": (payload) => {
+			try {
+				if (payload?.store === "sessionStorage") {
+					sessionStorage.removeItem(payload.key)
+				} else if (payload?.store === "localStorage") {
+					localStorage.removeItem(payload.key)
+				}
+				return { ok: true, data: storageDump() }
+			} catch (err) {
+				return { ok: false, error: err?.message ?? String(err) }
+			}
 		},
 		fonts: () => ({ ok: true, data: fontsReport() }),
 		colors: () => ({ ok: true, data: colorReport() }),

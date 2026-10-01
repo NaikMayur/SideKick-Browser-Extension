@@ -94,6 +94,27 @@ export function wcagVerdict(ratio) {
 	}
 }
 
+export function suggestAccessibleColor(foreground, background, targetRatio = 4.5) {
+	const fgRgb = parseColor(foreground)
+	const bgL = relativeLuminance(parseColor(background))
+	const { h, s } = rgbToHsl(fgRgb)
+
+	const stepDown = bgL > 0.5
+	let bestHex = null
+
+	for (let i = 0; i <= 100; i++) {
+		const l = stepDown ? 100 - i : i
+		const candidateRgb = hslToRgb(h, s / 100, l / 100)
+		const candidateHex = toHex(candidateRgb)
+		const ratio = contrastRatio(candidateHex, background)
+		if (ratio >= targetRatio) {
+			bestHex = candidateHex
+			break
+		}
+	}
+	return bestHex
+}
+
 export function shades(color, steps = 9) {
 	const base = parseColor(color)
 	const { h, s } = rgbToHsl(base)
@@ -134,7 +155,7 @@ export const designTools = [
 		name: "WCAG contrast checker",
 		category: "Design",
 		roles: ["design", "qa", "a11y"],
-		description: "Contrast ratio with AA/AAA verdicts for normal text, large text and UI parts.",
+		description: "Contrast ratio with AA/AAA verdicts for normal text, large text and UI parts, plus auto-fix suggestions.",
 		inputs: [
 			{ key: "foreground", label: "Foreground", type: "text", default: "#7D7A75" },
 			{ key: "background", label: "Background", type: "text", default: "#FFFFFF" },
@@ -143,7 +164,23 @@ export const designTools = [
 			const fg = required(foreground, "Foreground")
 			const bg = required(background, "Background")
 			const ratio = contrastRatio(fg, bg)
-			return { type: "json", value: { ...wcagVerdict(ratio), foreground: fg, background: bg } }
+			const verdict = wcagVerdict(ratio)
+			const suggestions = {}
+			if (!verdict.normalTextAA) {
+				suggestions.aa = suggestAccessibleColor(fg, bg, 4.5)
+			}
+			if (!verdict.normalTextAAA) {
+				suggestions.aaa = suggestAccessibleColor(fg, bg, 7.0)
+			}
+			return {
+				type: "json",
+				value: {
+					...verdict,
+					foreground: fg,
+					background: bg,
+					suggestions,
+				},
+			}
 		},
 	},
 	{

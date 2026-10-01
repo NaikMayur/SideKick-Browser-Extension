@@ -1,7 +1,7 @@
 # Sidekick
 
 Browser companion for developers, QA testers and designers.
-45 offline tools, zero runtime dependencies, zero telemetry, zero remote code right in one command palette.
+55+ offline tools, zero runtime dependencies, zero telemetry, zero remote code right in one command palette.
 
 ## Why Sidekick
 
@@ -46,6 +46,7 @@ node scripts/build.mjs
 | Design | Color Format Converter, WCAG Contrast Checker, Palette Swatches and Contrast Ramps, CSS Unit Converter, Type Scale, Shadow and Gradient Generator |
 | Testing and QA | HTTP Status Lookup, Bug Report Builder with auto environment capture, Gherkin Scenario Writer, Cross Browser Test Matrix, Core Web Vitals Budget |
 | API and Time | cURL and Fetch Builder, Mock Data Generator, Timestamp Converter, Timezone Comparer, Cron Explainer, Duration Calculator |
+| Media | Image Converter and Resizer (PNG, JPEG, WebP, BMP, GIF, ICO, PDF) with quality control and aspect-ratio-aware resize |
 
 ## Privacy
 

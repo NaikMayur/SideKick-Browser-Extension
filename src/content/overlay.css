@@ -71,8 +71,43 @@
 	background-size: 8px 8px, 8px 8px;
 }
 
+.dk-grid-12col {
+	position: fixed !important;
+	inset: 0 !important;
+	width: 100vw !important;
+	height: 100vh !important;
+	z-index: 2147483644 !important;
+	pointer-events: none !important;
+	display: flex !important;
+	justify-content: center !important;
+	padding: 0 24px !important;
+	box-sizing: border-box !important;
+}
+
+.dk-grid-12col-inner {
+	width: 100% !important;
+	max-width: 1280px !important;
+	height: 100% !important;
+	display: grid !important;
+	grid-template-columns: repeat(12, 1fr) !important;
+	gap: 16px !important;
+}
+
+.dk-grid-12col-col {
+	background: rgba(37, 99, 235, 0.08) !important;
+	border-left: 1px solid rgba(37, 99, 235, 0.25) !important;
+	border-right: 1px solid rgba(37, 99, 235, 0.25) !important;
+	height: 100% !important;
+}
+
 .dk-outline-all *:not(.dk-root):not(.dk-root *) {
 	outline: 1px solid rgba(229, 100, 88, 0.45) !important;
+}
+
+.dk-overflow-culprit {
+	outline: 2px dashed #ef4444 !important;
+	outline-offset: 1px !important;
+	box-shadow: 0 0 10px rgba(239, 68, 68, 0.7) !important;
 }
 
 .dk-badge {

@@ -189,3 +189,59 @@ export const testingTools = [
 		},
 	},
 ]
+
+export function parseCookieString(cookieString) {
+	if (!cookieString || typeof cookieString !== "string") return []
+	return cookieString
+		.split(";")
+		.map((c) => c.trim())
+		.filter(Boolean)
+		.map((c) => {
+			const eqIdx = c.indexOf("=")
+			if (eqIdx === -1) {
+				return { name: c, value: "", size: c.length }
+			}
+			const name = c.slice(0, eqIdx).trim()
+			const value = c.slice(eqIdx + 1).trim()
+			return { name, value, size: c.length }
+		})
+}
+
+export function formatStorageSize(bytes) {
+	if (!bytes || bytes <= 0) return "0 B"
+	if (bytes < 1024) return `${bytes} B`
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+	return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
+}
+
+export function getBreakpointBucket(width) {
+	const w = Number(width) || 0
+	if (w < 480) return "xs (Mobile)"
+	if (w < 768) return "sm (Mobile Lg)"
+	if (w < 1024) return "md (Tablet)"
+	if (w < 1280) return "lg (Laptop)"
+	if (w < 1536) return "xl (Desktop)"
+	return "2xl (Wide)"
+}
+
+export function calculateAspectRatio(width, height) {
+	const w = Math.round(Number(width)) || 0
+	const h = Math.round(Number(height)) || 0
+	if (w <= 0 || h <= 0) return "1:1"
+	const gcd = (a, b) => (b === 0 ? a : gcd(b, a % b))
+	const g = gcd(w, h)
+	const rw = Math.round(w / g)
+	const rh = Math.round(h / g)
+	if (rw > 32 || rh > 32) {
+		return (w / h).toFixed(2) + ":1"
+	}
+	return `${rw}:${rh}`
+}
+
+export function buildMediaQuery(width, type = "max-width") {
+	const w = Math.max(0, Math.round(Number(width) || 0))
+	const prop = type === "min-width" ? "min-width" : "max-width"
+	return `@media (${prop}: ${w}px)`
+}
+
+

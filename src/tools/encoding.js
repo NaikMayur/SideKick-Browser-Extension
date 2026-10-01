@@ -68,7 +68,7 @@ export const encodingTools = [
 		name: "JWT decoder",
 		category: "Encoding",
 		roles: ["dev", "qa", "security"],
-		description: "Decode header and payload, show expiry status. Signature is never sent anywhere.",
+		description: "Decode header, payload and claims, verify expiration and detect security risks.",
 		inputs: [{ key: "token", label: "JWT", type: "textarea", placeholder: "eyJhbGciOi..." }],
 		run: ({ token }) => {
 			const value = required(token, "JWT").trim()
@@ -76,19 +76,55 @@ export const encodingTools = [
 			if (parts.length < 2) throw new ToolError("A JWT needs at least header.payload")
 			const header = safeJsonParse(base64UrlDecode(parts[0]), "JWT header")
 			const payload = safeJsonParse(base64UrlDecode(parts[1]), "JWT payload")
-			let expiresAt = null
-			let expired = null
-			if (payload.exp !== undefined && payload.exp !== null) {
-				const expNum = Number(payload.exp)
-				if (!Number.isNaN(expNum) && expNum > 0) {
-					const expMs = expNum > 1e11 ? expNum : expNum * 1000
-					const expDate = new Date(expMs)
-					if (!Number.isNaN(expDate.getTime())) {
-						expiresAt = expDate.toISOString()
-						expired = expDate.getTime() < Date.now()
-					}
-				}
+
+			const parseDate = (val) => {
+				if (val === undefined || val === null) return null
+				const num = Number(val)
+				if (Number.isNaN(num) || num <= 0) return null
+				const ms = num > 1e11 ? num : num * 1000
+				const d = new Date(ms)
+				return Number.isNaN(d.getTime()) ? null : d
 			}
+
+			const formatRelative = (d) => {
+				if (!d) return null
+				const diffMs = d.getTime() - Date.now()
+				const isFuture = diffMs > 0
+				const sec = Math.floor(Math.abs(diffMs) / 1000)
+				if (sec < 60) return isFuture ? `in ${sec}s` : `${sec}s ago`
+				const min = Math.floor(sec / 60)
+				if (min < 60) return isFuture ? `in ${min}m` : `${min}m ago`
+				const hr = Math.floor(min / 60)
+				if (hr < 24) return isFuture ? `in ${hr}h` : `${hr}h ago`
+				const days = Math.floor(hr / 24)
+				return isFuture ? `in ${days}d` : `${days}d ago`
+			}
+
+			const expDate = parseDate(payload.exp)
+			const iatDate = parseDate(payload.iat)
+			const nbfDate = parseDate(payload.nbf)
+
+			const expiresAt = expDate ? expDate.toISOString() : null
+			const expired = expDate ? expDate.getTime() < Date.now() : null
+			const issuedAt = iatDate ? iatDate.toISOString() : null
+			const notBefore = nbfDate ? nbfDate.toISOString() : null
+
+			const warnings = []
+			if (header.alg === "none" || header.alg === "NONE") {
+				warnings.push("High security risk: Algorithm is set to 'none' (unsigned token)")
+			}
+			if (!payload.exp) {
+				warnings.push("No expiration claim (exp) present; token does not expire")
+			} else if (expired) {
+				warnings.push(`Token expired ${formatRelative(expDate)} (${expiresAt})`)
+			}
+			if (nbfDate && nbfDate.getTime() > Date.now()) {
+				warnings.push(`Token not active yet (not valid before ${formatRelative(nbfDate)})`)
+			}
+			if (parts.length < 3 || !parts[2]) {
+				warnings.push("No cryptographic signature segment present")
+			}
+
 			return {
 				type: "json",
 				value: {
@@ -97,6 +133,16 @@ export const encodingTools = [
 					signaturePresent: parts.length === 3 && parts[2].length > 0,
 					expiresAt,
 					expired,
+					issuedAt,
+					notBefore,
+					relativeExpiry: formatRelative(expDate),
+					relativeIssued: formatRelative(iatDate),
+					warnings,
+					rawParts: {
+						header: parts[0],
+						payload: parts[1],
+						signature: parts[2] || "",
+					},
 				},
 			}
 		},

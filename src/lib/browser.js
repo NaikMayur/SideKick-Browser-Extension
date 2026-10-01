@@ -65,7 +65,7 @@ export const api = {
 		sendMessage: (tabId, message) => call("tabs.sendMessage", tabId, message),
 		create: (info) => call("tabs.create", info),
 		update: (tabId, info) => call("tabs.update", tabId, info),
-		captureVisibleTab: (opts) => call("tabs.captureVisibleTab", opts),
+		captureVisibleTab: (opts) => (opts !== undefined ? call("tabs.captureVisibleTab", opts) : call("tabs.captureVisibleTab")),
 	},
 	runtime: {
 		sendMessage: (message) => call("runtime.sendMessage", message),
@@ -83,6 +83,11 @@ export const api = {
 	downloads: {
 		download: (options) => call("downloads.download", options),
 	},
+	windows: {
+		getCurrent: (opts) => (opts !== undefined ? call("windows.getCurrent", opts) : call("windows.getCurrent")),
+		update: (windowId, updateInfo) => call("windows.update", windowId, updateInfo),
+		create: (createData) => call("windows.create", createData),
+	},
 	commands: raw?.commands,
 	contextMenus: raw?.contextMenus ?? raw?.menus,
 }
@@ -90,7 +95,18 @@ export const api = {
 export async function activeTab() {
 	try {
 		const tabs = await api.tabs.query({ active: true, currentWindow: true })
-		return tabs?.[0] ?? null
+		const current = tabs?.[0]
+		const extPrefix = api.runtime?.getURL ? api.runtime.getURL("") : ""
+		if (current && (!extPrefix || !current.url?.startsWith(extPrefix))) {
+			return current
+		}
+		const lastFocused = await api.tabs.query({ active: true, lastFocusedWindow: true })
+		if (lastFocused?.[0] && (!extPrefix || !lastFocused[0].url?.startsWith(extPrefix))) {
+			return lastFocused[0]
+		}
+		const allTabs = await api.tabs.query({ active: true })
+		const target = allTabs?.find((t) => !extPrefix || !t.url?.startsWith(extPrefix))
+		return target ?? current ?? null
 	} catch {
 		return null
 	}
@@ -160,3 +176,35 @@ export async function sendToPage(message) {
 		}
 	}
 }
+
+export async function resizeCurrentWindow(width, height) {
+	try {
+		if (!isExtension) return { ok: false, error: "No window found (extension runtime unavailable)" }
+		const tab = await activeTab()
+		let winId = tab?.windowId
+		if (!winId && api.windows?.getCurrent) {
+			try {
+				const cur = await api.windows.getCurrent()
+				winId = cur?.id
+			} catch {  }
+		}
+		if (!winId) return { ok: false, error: "No window found to resize" }
+
+		const targetW = Math.max(280, Math.round(Number(width) || 800))
+		const targetH = Math.max(200, Math.round(Number(height) || 600))
+
+		try {
+			await api.windows.update(winId, { state: "normal", width: targetW, height: targetH })
+			return { ok: true, width: targetW, height: targetH }
+		} catch {
+			try {
+				await api.windows.update(winId, { state: "normal" })
+			} catch {  }
+			await api.windows.update(winId, { width: targetW, height: targetH })
+			return { ok: true, width: targetW, height: targetH }
+		}
+	} catch (err) {
+		return { ok: false, error: err?.message || String(err) }
+	}
+}
+

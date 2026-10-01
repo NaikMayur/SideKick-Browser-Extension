@@ -36,7 +36,18 @@ export function toCase(input, style) {
 	}
 }
 
-export function diffLines(left, right) {
+export function diffLines(left, right, options = {}) {
+	const ignoreWhitespace = options.ignoreWhitespace || "none"
+	const ignoreCase = Boolean(options.ignoreCase)
+
+	const normalize = (line) => {
+		let s = String(line)
+		if (ignoreCase) s = s.toLowerCase()
+		if (ignoreWhitespace === "trim") s = s.trim()
+		else if (ignoreWhitespace === "all") s = s.replace(/\s+/g, "")
+		return s
+	}
+
 	const a = String(left).split("\n")
 	const b = String(right).split("\n")
 	const maxLines = 1500
@@ -45,29 +56,33 @@ export function diffLines(left, right) {
 	const table = Array.from({ length: aCapped.length + 1 }, () => new Array(bCapped.length + 1).fill(0))
 	for (let i = aCapped.length - 1; i >= 0; i -= 1) {
 		for (let j = bCapped.length - 1; j >= 0; j -= 1) {
-			table[i][j] = aCapped[i] === bCapped[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1])
+			table[i][j] = normalize(aCapped[i]) === normalize(bCapped[j])
+				? table[i + 1][j + 1] + 1
+				: Math.max(table[i + 1][j], table[i][j + 1])
 		}
 	}
 	const rows = []
 	let i = 0
 	let j = 0
+	let lineA = 1
+	let lineB = 1
 	while (i < aCapped.length && j < bCapped.length) {
-		if (aCapped[i] === bCapped[j]) {
-			rows.push({ op: "=", text: aCapped[i] })
+		if (normalize(aCapped[i]) === normalize(bCapped[j])) {
+			rows.push({ op: "=", text: aCapped[i], lineA: lineA++, lineB: lineB++ })
 			i += 1
 			j += 1
 		} else if (table[i + 1][j] >= table[i][j + 1]) {
-			rows.push({ op: "-", text: aCapped[i] })
+			rows.push({ op: "-", text: aCapped[i], lineA: lineA++, lineB: null })
 			i += 1
 		} else {
-			rows.push({ op: "+", text: bCapped[j] })
+			rows.push({ op: "+", text: bCapped[j], lineA: null, lineB: lineB++ })
 			j += 1
 		}
 	}
-	while (i < aCapped.length) rows.push({ op: "-", text: aCapped[i++] })
-	while (j < bCapped.length) rows.push({ op: "+", text: bCapped[j++] })
+	while (i < aCapped.length) rows.push({ op: "-", text: aCapped[i++], lineA: lineA++, lineB: null })
+	while (j < bCapped.length) rows.push({ op: "+", text: bCapped[j++], lineA: null, lineB: lineB++ })
 	if (a.length > maxLines || b.length > maxLines) {
-		rows.push({ op: "=", text: `… diff truncated at ${maxLines} lines to preserve performance` })
+		rows.push({ op: "=", text: `… diff truncated at ${maxLines} lines to preserve performance`, lineA: null, lineB: null })
 	}
 	return rows
 }
@@ -113,16 +128,36 @@ export const textTools = [
 		name: "JSON formatter & validator",
 		category: "Text & data",
 		roles: ["dev", "qa"],
-		description: "Pretty-print, minify and validate JSON with precise error positions.",
+		description: "Pretty-print, minify, sort keys, strip nulls and validate JSON with precise error positions.",
 		inputs: [
 			{ key: "text", label: "JSON", type: "textarea", placeholder: '{"a":1}' },
-			{ key: "mode", label: "Mode", type: "select", options: ["pretty", "minify", "sort-keys"], default: "pretty" },
+			{
+				key: "mode",
+				label: "Mode",
+				type: "select",
+				options: ["pretty", "pretty-4", "pretty-tab", "minify", "sort-keys", "remove-nulls", "unescape"],
+				default: "pretty",
+			},
 		],
 		run: ({ text, mode = "pretty" }) => {
-			const parsed = safeJsonParse(required(text, "JSON"))
+			let inputStr = required(text, "JSON")
+			if (mode === "unescape") {
+				if ((inputStr.startsWith('"') && inputStr.endsWith('"')) || inputStr.includes('\\"')) {
+					try {
+						inputStr = JSON.parse(inputStr)
+					} catch {
+						inputStr = inputStr.replace(/\\"/g, '"').replace(/\\\\/g, "\\")
+					}
+				}
+			}
+			const parsed = parseJsonWithDiagnostics(inputStr)
 			if (mode === "minify") return { type: "text", value: JSON.stringify(parsed) }
-			const value = mode === "sort-keys" ? sortKeys(parsed) : parsed
-			return { type: "text", value: JSON.stringify(value, null, 2) }
+			let value = parsed
+			if (mode === "sort-keys") value = sortKeys(parsed)
+			else if (mode === "remove-nulls") value = removeNulls(parsed)
+
+			const indent = mode === "pretty-4" ? 4 : mode === "pretty-tab" ? "\t" : 2
+			return { type: "text", value: JSON.stringify(value, null, indent) }
 		},
 	},
 	{
@@ -191,13 +226,32 @@ export const textTools = [
 		inputs: [
 			{ key: "left", label: "Expected", type: "textarea" },
 			{ key: "right", label: "Actual", type: "textarea" },
+			{
+				key: "whitespace",
+				label: "Whitespace",
+				type: "select",
+				options: ["keep", "trim", "ignore-all"],
+				default: "keep",
+			},
+			{
+				key: "ignoreCase",
+				label: "Ignore case",
+				type: "select",
+				options: ["no", "yes"],
+				default: "no",
+			},
 		],
-		run: ({ left = "", right = "" }) => {
-			const rows = diffLines(left, right)
-			const changed = rows.filter((r) => r.op !== "=").length
+		run: ({ left = "", right = "", whitespace = "keep", ignoreCase = "no" }) => {
+			const rows = diffLines(left, right, {
+				ignoreWhitespace: whitespace === "trim" ? "trim" : whitespace === "ignore-all" ? "all" : "none",
+				ignoreCase: ignoreCase === "yes" || ignoreCase === true,
+			})
+			const added = rows.filter((r) => r.op === "+").length
+			const deleted = rows.filter((r) => r.op === "-").length
+			const changed = added + deleted
 			return {
 				type: "text",
-				value: `${changed} changed line(s)\n\n${rows.map((r) => `${r.op} ${r.text}`).join("\n")}`,
+				value: `${changed} changed line(s) (+${added}, -${deleted})\n\n${rows.map((r) => `${r.op} ${r.text}`).join("\n")}`,
 			}
 		},
 	},
@@ -234,4 +288,49 @@ export function sortKeys(value) {
 		)
 	}
 	return value
+}
+
+export function removeNulls(value) {
+	if (Array.isArray(value)) return value.map(removeNulls).filter((v) => v !== null && v !== undefined)
+	if (value && typeof value === "object") {
+		return Object.fromEntries(
+			Object.entries(value)
+				.filter(([, v]) => v !== null && v !== undefined)
+				.map(([k, v]) => [k, removeNulls(v)]),
+		)
+	}
+	return value
+}
+
+export function parseJsonWithDiagnostics(text, label = "JSON") {
+	try {
+		return JSON.parse(text)
+	} catch (err) {
+		const raw = String(text)
+		let line = 1
+		let column = 1
+		const posMatch = err.message.match(/at position (\d+)/i)
+		if (posMatch) {
+			const pos = Number(posMatch[1])
+			line = 1
+			column = 1
+			for (let i = 0; i < pos && i < raw.length; i++) {
+				if (raw[i] === "\n") {
+					line++
+					column = 1
+				} else {
+					column++
+				}
+			}
+		}
+		const lineMatch = err.message.match(/line (\d+) column (\d+)/i)
+		if (lineMatch) {
+			line = Number(lineMatch[1])
+			column = Number(lineMatch[2])
+		}
+		const lines = raw.split("\n")
+		const errLine = lines[line - 1] || ""
+		const caret = " ".repeat(Math.max(0, column - 1)) + "^"
+		throw new ToolError(`Invalid ${label} at line ${line}, column ${column}:\n${errLine}\n${caret}\n(${err.message})`)
+	}
 }
