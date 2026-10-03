@@ -1,92 +1,283 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="color-scheme" content="dark light" />
 		<title>Sidekick settings</title>
+		<script src="../popup/mode.js"></script>
+		<link rel="icon" type="image/svg+xml" href="../assets/logo.svg" />
 		<link rel="stylesheet" href="../popup/popup.css" />
 		<style>
-			html, body {
-				height: auto;
-				overflow: auto;
-			}
 			body {
-				width: 100%;
-				max-height: none;
+				min-height: 100vh;
 			}
-			.wrap {
-				max-width: 760px;
+			.page {
+				max-width: 780px;
 				margin: 0 auto;
-				padding: 32px 24px 64px;
+				padding: 32px 20px 64px;
 			}
-			section {
-				border: 1px solid var(--border);
-				border-radius: var(--radius);
-				padding: 20px;
+			.page-head {
+				display: flex;
+				align-items: center;
+				gap: 12px;
 				margin-bottom: 24px;
 			}
-			table {
-				width: 100%;
-				border-collapse: collapse;
+			.page-head .brand-mark {
+				width: 40px;
+				height: 40px;
+				border-radius: 12px;
+			}
+			.page-head .brand-mark .i {
+				width: 24px;
+				height: 24px;
+			}
+			.page-head h1 {
+				font-size: 24px;
+				letter-spacing: -0.035em;
+			}
+			.env {
+				color: var(--muted);
+				font-size: 11px;
+			}
+			.card {
+				margin-bottom: 16px;
+				padding: 18px 20px;
+				border: 1px solid var(--line);
+				border-radius: 14px;
+				background: var(--surface);
+				box-shadow: var(--shadow);
+			}
+			.card > h2 {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				margin-bottom: 4px;
+				font-size: 15px;
+			}
+			.card > h2 .i {
+				color: var(--accent-text);
+			}
+			.card > .lead {
+				margin-bottom: 14px;
+				color: var(--muted);
+				font-size: 12.5px;
+			}
+			.setting {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				gap: 16px;
+				padding: 12px 0;
+				border-top: 1px dashed var(--line);
+			}
+			.setting:first-of-type {
+				border-top: 0;
+			}
+			.setting-text strong {
+				display: block;
 				font-size: 13px;
 			}
-			td,
-			th {
-				border-bottom: 1px solid var(--border);
-				padding: 8px;
+			.setting-text span {
+				color: var(--muted);
+				font-size: 12px;
+			}
+			.setting select {
+				width: auto;
+				min-width: 170px;
+			}
+			.seg.big {
+				margin: 0;
+			}
+			.seg.big .seg-btn {
+				min-height: 28px;
+				padding: 2px 12px;
+				font-size: 12px;
+			}
+			.seg.big .seg-btn .i {
+				width: 14px;
+				height: 14px;
+			}
+			.data-grid {
+				display: grid;
+				grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+				gap: 8px;
+				margin-bottom: 14px;
+			}
+			.data-cell {
+				display: flex;
+				flex-direction: column;
+				gap: 8px;
+				padding: 12px;
+				border: 1px solid var(--line);
+				border-radius: 10px;
+				background: var(--canvas);
+			}
+			.data-cell strong {
+				font-size: 20px;
+				letter-spacing: -0.03em;
+			}
+			.data-cell span {
+				color: var(--muted);
+				font-size: 11.5px;
+			}
+			.notice {
+				margin-top: 12px;
+				font-size: 12px;
+			}
+			.notice:empty {
+				display: none;
+			}
+			.kbd-table,
+			.catalogue {
+				width: 100%;
+				border-collapse: collapse;
+				font-size: 12.5px;
+			}
+			.kbd-table td,
+			.catalogue td,
+			.catalogue th {
+				padding: 8px 6px;
+				border-top: 1px dashed var(--line);
 				text-align: left;
-				vertical-align: top;
+				vertical-align: middle;
+			}
+			.kbd-table td:first-child {
+				width: 42%;
+				white-space: nowrap;
+			}
+			.catalogue th {
+				border-top: 0;
+				color: var(--faint);
+				font-family: var(--mono);
+				font-size: 9.5px;
+				letter-spacing: 0.09em;
+				text-transform: uppercase;
+			}
+			.cat-tool {
+				display: flex;
+				align-items: center;
+				gap: 10px;
+			}
+			.cat-tool .tile {
+				width: 28px;
+				height: 28px;
+				border-radius: 8px;
+			}
+			.cat-tool .tile .i {
+				width: 15px;
+				height: 15px;
+			}
+			.cat-roles {
+				color: var(--muted);
+				font-size: 11.5px;
+			}
+			#catalogue-filter {
+				margin-bottom: 8px;
+			}
+			.welcome {
+				margin-bottom: 16px;
+			}
+			.danger-zone {
+				margin-top: 12px;
+				padding-top: 12px;
+				border-top: 1px dashed var(--line);
+			}
+			.btn.danger {
+				border-color: color-mix(in srgb, var(--bad) 40%, transparent);
 			}
 		</style>
 	</head>
 	<body>
-		<div class="wrap">
-			<h1>Sidekick</h1>
-			<p class="muted" id="env">Loading environment…</p>
-
-			<section>
-				<h2>Preferences</h2>
-				<div class="field">
-					<label for="theme">Theme</label>
-					<select id="theme">
-						<option value="system">Match system</option>
-						<option value="light">Light</option>
-						<option value="dark">Dark</option>
-					</select>
+		<div class="page">
+			<header class="page-head">
+				<span class="brand-mark" aria-hidden="true"><svg class="i"><use href="../assets/icons.svg#i-logo" /></svg></span>
+				<div>
+					<h1>Sidekick settings</h1>
+					<p class="env mono" id="env">Loading…</p>
 				</div>
-				<div class="field">
-					<label for="role">Default role filter</label>
+			</header>
+
+			<div id="welcome" class="callout tone-good welcome" hidden>
+				<svg class="i callout-icon" aria-hidden="true"><use href="../assets/icons.svg#i-check-circle" /></svg>
+				<div class="callout-body">
+					<strong class="callout-title">Sidekick is installed</strong>
+					<p class="callout-hint">Press Alt+Shift+D or click the toolbar icon to open it. Everything runs locally; nothing leaves your browser.</p>
+				</div>
+			</div>
+
+			<section class="card" aria-labelledby="h-prefs">
+				<h2 id="h-prefs"><svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-settings" /></svg>Preferences</h2>
+				<p class="lead">Saved instantly and shared by the popup, side panel and pop out window.</p>
+				<div class="setting">
+					<div class="setting-text"><strong id="theme-label">Theme</strong><span>Workbench light, dark, or follow the system.</span></div>
+					<div id="theme" class="seg big" role="radiogroup" aria-labelledby="theme-label">
+						<button class="seg-btn" type="button" role="radio" data-value="system"><svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-monitor" /></svg>System</button>
+						<button class="seg-btn" type="button" role="radio" data-value="light"><svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-sun" /></svg>Light</button>
+						<button class="seg-btn" type="button" role="radio" data-value="dark"><svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-moon" /></svg>Dark</button>
+					</div>
+				</div>
+				<div class="setting">
+					<div class="setting-text"><label for="role"><strong>Default role filter</strong></label><span>Which tools the list shows first.</span></div>
 					<select id="role"></select>
 				</div>
-				<div class="row">
-					<button id="export" type="button">Export settings &amp; snippets</button>
-					<button id="clear" type="button">Clear all local data</button>
+				<div class="setting">
+					<div class="setting-text"><strong>Live results</strong><span>Rerun cheap local tools as you type. Page tools and file tools always wait for Run.</span></div>
+					<label class="switch" for="live-run">
+						<input id="live-run" class="switch-input" type="checkbox" role="switch" />
+						<span class="switch-track"></span>
+						<span class="visually-hidden">Live results</span>
+					</label>
 				</div>
-				<p id="saved" class="muted"></p>
+				<p id="saved" class="notice muted" role="status"></p>
 			</section>
 
-			<section>
-				<h2>Keyboard shortcuts</h2>
-				<table>
-					<tr><th>Alt+Shift+D</th><td>Open Sidekick</td></tr>
-					<tr><th>Alt+Shift+I</th><td>Toggle element inspector</td></tr>
-					<tr><th>Alt+Shift+G</th><td>Toggle layout grid</td></tr>
-					<tr><th>&uarr; &darr; / Enter</th><td>Navigate and open tools from search</td></tr>
-					<tr><th>Ctrl/Cmd+Enter</th><td>Run the open tool</td></tr>
-					<tr><th>Esc</th><td>Back to the tool list</td></tr>
+			<section class="card" aria-labelledby="h-data">
+				<h2 id="h-data"><svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-database" /></svg>Your data</h2>
+				<p class="lead">Stored only in this browser's extension storage. Secrets, tokens, passwords and files are never saved as drafts.</p>
+				<div class="data-grid">
+					<div class="data-cell"><strong id="count-pinned">0</strong><span>Pinned tools</span><button id="clear-pinned" class="btn" type="button">Clear pins</button></div>
+					<div class="data-cell"><strong id="count-history">0</strong><span>History entries</span><button id="clear-history" class="btn" type="button">Clear history</button></div>
+					<div class="data-cell"><strong id="count-drafts">0</strong><span>Saved form drafts</span><button id="clear-drafts" class="btn" type="button">Clear drafts</button></div>
+				</div>
+				<div class="row">
+					<button id="export" class="btn" type="button"><svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-download" /></svg>Export settings</button>
+					<button id="import" class="btn" type="button"><svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-upload" /></svg>Import settings</button>
+					<input id="import-file" class="visually-hidden" type="file" accept="application/json,.json" tabindex="-1" />
+				</div>
+				<div class="danger-zone row">
+					<button id="clear" class="btn danger" type="button"><svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-trash" /></svg>Reset everything</button>
+				</div>
+				<div id="data-notice" class="notice" role="status"></div>
+			</section>
+
+			<section class="card" aria-labelledby="h-keys">
+				<h2 id="h-keys"><svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-keyboard" /></svg>Keyboard</h2>
+				<table class="kbd-table">
+					<tr><td><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd></td><td>Open Sidekick</td></tr>
+					<tr><td><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>I</kbd></td><td>Toggle the element inspector</td></tr>
+					<tr><td><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd></td><td>Toggle the layout grid</td></tr>
+					<tr><td><kbd>/</kbd></td><td>Focus search</td></tr>
+					<tr><td><kbd>&uarr;</kbd> <kbd>&darr;</kbd> <kbd>Enter</kbd></td><td>Move through the list and open a tool</td></tr>
+					<tr><td><kbd>Ctrl</kbd> / <kbd>Cmd</kbd> + <kbd>Enter</kbd></td><td>Run the open tool</td></tr>
+					<tr><td><kbd>Esc</kbd></td><td>Leave a field, press again to go back to the list</td></tr>
 				</table>
 			</section>
 
-			<section>
-				<h2>Tool catalogue</h2>
-				<p class="muted" id="count"></p>
-				<table id="catalogue"></table>
+			<section class="card" aria-labelledby="h-cat">
+				<h2 id="h-cat"><svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-layers" /></svg>Tool catalogue</h2>
+				<p class="lead" id="count"></p>
+				<input id="catalogue-filter" type="search" placeholder="Filter tools" aria-label="Filter the catalogue" />
+				<table class="catalogue">
+					<thead><tr><th>Tool</th><th>Category</th><th>Made for</th></tr></thead>
+					<tbody id="catalogue"></tbody>
+				</table>
 			</section>
 
-			<section>
-				<h2>Privacy</h2>
-				<p class="muted">
-					Sidekick runs entirely on your machine. No telemetry, no accounts, no network calls: every tool is pure
+			<section class="card" aria-labelledby="h-privacy">
+				<h2 id="h-privacy"><svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-shield" /></svg>Privacy</h2>
+				<p class="lead">
+					Sidekick runs entirely on your machine. No telemetry, no accounts, no remote fonts or scripts: every tool is plain
 					JavaScript executed in your browser, and settings live in local extension storage only.
 				</p>
 			</section>

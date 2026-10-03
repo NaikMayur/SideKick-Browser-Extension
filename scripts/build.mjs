@@ -5,8 +5,8 @@
  */
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
-import { execFileSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
+import { zipDirectory } from "./zip.mjs"
 
 const root = fileURLToPath(new URL("..", import.meta.url))
 const src = join(root, "src")
@@ -34,11 +34,7 @@ for (const target of TARGETS) {
 	writeFileSync(join(out, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`)
 	rmSync(join(out, "manifest.chrome.json"), { force: true })
 	rmSync(join(out, "manifest.firefox.json"), { force: true })
-	try {
-		execFileSync("zip", ["-qr", join(dist, `sidekick-${target.name}-${version}.zip`), "."], { cwd: out })
-	} catch {
-		console.warn(`zip unavailable — folder build only for ${target.name}`)
-	}
+	zipDirectory(out, join(dist, `sidekick-${target.name}-${version}.zip`))
 	console.warn(`built ${target.name}`)
 }
 

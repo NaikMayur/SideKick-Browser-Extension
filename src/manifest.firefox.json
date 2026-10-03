@@ -3,9 +3,9 @@
   "name": "Sidekick",
   "short_name": "Sidekick",
   "version": "1.0.0",
-  "description": "45 offline tools for developers, testers and designers to inspect, convert, audit and report in every browser.",
+  "description": "Offline toolkit for developers, testers and designers: inspect, audit, convert and report on any page, with zero tracking.",
   "browser_specific_settings": {
-    "gecko": { "id": "sidekick@example.com", "strict_min_version": "121.0" }
+    "gecko": { "id": "sidekick@example.com", "strict_min_version": "128.0" }
   },
   "action": {
     "default_title": "Sidekick",
@@ -20,9 +20,9 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content/content.js"],
-      "css": ["content/overlay.css"],
-      "run_at": "document_idle"
+      "js": ["content/main-world.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ],
   "commands": {

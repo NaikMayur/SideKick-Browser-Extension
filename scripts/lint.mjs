@@ -80,15 +80,20 @@ for (const permission of chrome.permissions) {
 	if (!firefox.permissions.includes(permission)) problems.push(`Firefox manifest missing permission: ${permission}`)
 }
 
+const { PAGE_INJECTION } = await import(pathToFileURL(join(src, "lib", "browser.js")).href)
+const manifestFiles = (manifest) => [
+	manifest.action?.default_popup,
+	manifest.devtools_page,
+	manifest.options_ui?.page,
+	manifest.background?.service_worker,
+	...(manifest.background?.scripts ?? []),
+	manifest.side_panel?.default_path,
+	manifest.sidebar_action?.default_panel,
+	...(manifest.content_scripts ?? []).flatMap((cs) => [...(cs.js ?? []), ...(cs.css ?? [])]),
+	...Object.values(manifest.icons ?? {}),
+]
 const referenced = new Set(
-	[
-		chrome.action.default_popup,
-		chrome.devtools_page,
-		chrome.options_ui?.page,
-		chrome.background.service_worker,
-		...chrome.content_scripts.flatMap((cs) => [...cs.js, ...cs.css]),
-		...Object.values(chrome.icons ?? {}),
-	].filter(Boolean),
+	[...manifestFiles(chrome), ...manifestFiles(firefox), ...(PAGE_INJECTION?.js ?? []), ...(PAGE_INJECTION?.css ?? [])].filter(Boolean),
 )
 for (const path of referenced) {
 	if (!existsSync(join(src, path))) problems.push(`manifest references missing file: ${path}`)

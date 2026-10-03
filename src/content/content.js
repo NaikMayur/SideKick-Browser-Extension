@@ -1,11 +1,43 @@
 
 ;(() => {
-	if (window.__devkitLoaded) return
-	window.__devkitLoaded = true
-
 	const runtime = typeof browser !== "undefined" && browser.runtime ? browser : chrome
-	const state = { inspect: false, grid: false, outline: false, edit: false, viewport: false, deviceFrame: null }
-	const LOG_CAP = 300
+
+	// One core object per page. After an extension reload/update the old isolated-world script
+	// keeps running but its runtime is invalidated (runtime.id throws or is undefined). A fresh
+	// injection detects that, tears the dead instance down and replaces it.
+	const CORE_KEY = "__sidekickCore"
+	const previousCore = window[CORE_KEY]
+	if (previousCore) {
+		let previousAlive = false
+		try {
+			previousAlive = Boolean(previousCore.alive?.())
+		} catch {}
+		if (previousAlive) return
+		try {
+			previousCore.teardown?.()
+		} catch {}
+	}
+	try {
+		delete window.__devkitLoaded
+	} catch {}
+
+	const CORE_TOKEN = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+	const coreTeardowns = []
+	const core = {
+		token: CORE_TOKEN,
+		alive() {
+			try {
+				return Boolean(runtime?.runtime?.id)
+			} catch {
+				return false
+			}
+		},
+		teardown() {},
+	}
+	window[CORE_KEY] = core
+
+	const state = { inspect: false, grid: false, outline: false, edit: false, viewport: false, deviceFrame: null, measure: false }
+	const LOG_CAP = 200
 	const logBuffer = new Array(LOG_CAP)
 	let logCount = 0
 	let logHead = 0
@@ -14,15 +46,16 @@
 	let badge = null
 	let deviceSimulator = null
 
-	for (const level of ["error", "warn"]) {
-		const original = console[level].bind(console)
-		console[level] = (...args) => {
-			push(level, args.map(stringify).join(" "))
-			original(...args)
-		}
-	}
-	window.addEventListener("error", (event) => push("error", `${event.message} @ ${event.filename}:${event.lineno}`))
-	window.addEventListener("unhandledrejection", (event) => push("rejection", stringify(event.reason)))
+	// Fallback capture in the isolated world (only window errors are visible here). The real
+	// console buffer lives in content/main-world.js, which runs in the page's MAIN world.
+	const onIsolatedError = (event) => push("error", `${event.message} @ ${event.filename}:${event.lineno}`)
+	const onIsolatedRejection = (event) => push("rejection", stringify(event.reason))
+	window.addEventListener("error", onIsolatedError)
+	window.addEventListener("unhandledrejection", onIsolatedRejection)
+	coreTeardowns.push(() => {
+		window.removeEventListener("error", onIsolatedError)
+		window.removeEventListener("unhandledrejection", onIsolatedRejection)
+	})
 
 	function push(level, message) {
 		logBuffer[logHead] = { level, message: String(message).slice(0, 600), at: new Date().toISOString() }
@@ -30,7 +63,38 @@
 		if (logCount < LOG_CAP) logCount++
 	}
 
+	function mainWorldCall(requestType, responseType, detail, target = document) {
+		let result = null
+		const onResult = (event) => {
+			result = event.detail
+		}
+		document.addEventListener(responseType, onResult)
+		try {
+			target.dispatchEvent(new CustomEvent(requestType, { detail: JSON.stringify(detail ?? {}), bubbles: false }))
+		} catch {
+		} finally {
+			document.removeEventListener(responseType, onResult)
+		}
+		if (typeof result !== "string") return null
+		try {
+			return JSON.parse(result)
+		} catch {
+			return null
+		}
+	}
+
+	function probeMain(request, target = document) {
+		return mainWorldCall("sidekick:probe", "sidekick:probe-result", request, target)
+	}
+
+	function readMainConsole(limit) {
+		const response = mainWorldCall("sidekick:console-request", "sidekick:console-response", { limit })
+		return response && Array.isArray(response.logs) ? response : null
+	}
+
 	function getRecentLogs(limit = 100) {
+		const main = readMainConsole(limit)
+		if (main) return main.logs.filter(Boolean)
 		const res = []
 		const count = Math.min(limit, logCount)
 		const start = (logHead - count + LOG_CAP) % LOG_CAP
@@ -41,11 +105,28 @@
 	}
 
 	function countConsoleErrors() {
+		const main = readMainConsole(1)
+		if (main) return main.errors ?? 0
 		let count = 0
 		for (let i = 0; i < logCount; i++) {
-			if (logBuffer[i] && logBuffer[i].level === "error") count++
+			if (logBuffer[i] && logBuffer[i].level !== "warn") count++
 		}
 		return count
+	}
+
+	function sendRuntime(message) {
+		try {
+			const pending = runtime.runtime.sendMessage(message)
+			if (pending && typeof pending.then === "function") {
+				return pending.then(
+					(response) => response ?? { ok: false, error: "No response" },
+					(error) => ({ ok: false, error: error?.message ?? String(error) }),
+				)
+			}
+		} catch (error) {
+			return Promise.resolve({ ok: false, error: error?.message ?? String(error) })
+		}
+		return Promise.resolve({ ok: false, error: "Messaging unavailable" })
 	}
 
 	function stringify(value) {
@@ -60,6 +141,78 @@
 		return String(value)
 	}
 
+	const SVG_NS = "http://www.w3.org/2000/svg"
+	const HOST_ID = "sidekick-overlay-host"
+	const LEGACY_HOST_ID = "devkit-shadow-host"
+
+	// Small stroke icons (24px grid). Paths only, so no markup strings ever reach innerHTML.
+	const ICONS = {
+		close: "M18 6 6 18M6 6l12 12",
+		check: "M20 6 9 17l-5-5",
+		copy: "M9 9h11v11H9zM5 15H4V4h11v1",
+		minus: "M5 12h14",
+		plus: "M12 5v14M5 12h14",
+		ruler: "M3 17 17 3l4 4L7 21zM7.5 12.5l2 2M10.5 9.5l2 2M13.5 6.5l2 2",
+		type: "M4 7V4h16v3M9 20h6M12 4v16",
+		grip: "M9 6h.01M9 12h.01M9 18h.01M15 6h.01M15 12h.01M15 18h.01",
+		edit: "M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z",
+		duplicate: "M8 8h12v12H8zM4 16V4h12",
+		up: "m18 15-6-6-6 6",
+		down: "m6 9 6 6 6-6",
+		parent: "M14 9 9 4 4 9M20 20h-7a4 4 0 0 1-4-4V4",
+		child: "m10 15 5 5 5-5M4 4h7a4 4 0 0 1 4 4v12",
+		reset: "M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5",
+		trash: "M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6",
+		phone: "M7 2h10a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zM12 18h.01",
+		laptop: "M4 5h16v11H4zM2 20h20",
+		monitor: "M3 4h18v12H3zM8 20h8M12 16v4",
+		rotate: "M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5",
+		info: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 16v-4M12 8h.01",
+		scissors: "M6 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM20 4 8.1 15.9M14.5 14.5 20 20M8.1 8.1 12 12",
+		camera: "M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3zM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z",
+		alert: "M12 3 2 21h20zM12 9v5M12 17h.01",
+		pipette: "m2 22 1-1h3l9-9M3 21v-3l9-9M15 6l3-3 3 3-3 3M12 9l3 3",
+		crosshair: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM22 12h-4M6 12H2M12 6V2M12 22v-4",
+		code: "m16 18 6-6-6-6M8 6l-6 6 6 6",
+		palette: "M12 22a10 10 0 1 1 10-10c0 2.8-2.2 4-4 4h-2a2 2 0 0 0-1 3.7A1.5 1.5 0 0 1 12 22zM7.5 10.5h.01M12 7.5h.01M16.5 10.5h.01",
+		target: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 18a6 6 0 1 0 0-12 6 6 0 0 0 0 12zM12 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4z",
+		layers: "M12 2 2 7l10 5 10-5zM2 17l10 5 10-5M2 12l10 5 10-5",
+		file: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6",
+		sparkle: "M12 3l1.9 5.8L20 11l-6.1 2.2L12 19l-1.9-5.8L4 11l6.1-2.2z",
+		move: "M5 9l-3 3 3 3M9 5l3-3 3 3M15 19l-3 3-3-3M19 9l3 3-3 3M2 12h20M12 2v20",
+		grid: "M3 3h18v18H3zM3 9h18M3 15h18M9 3v18M15 3v18",
+		eye: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
+	}
+
+	function icon(name, size = 14) {
+		const svg = document.createElementNS(SVG_NS, "svg")
+		svg.setAttribute("viewBox", "0 0 24 24")
+		svg.setAttribute("width", String(size))
+		svg.setAttribute("height", String(size))
+		svg.setAttribute("fill", "none")
+		svg.setAttribute("stroke", "currentColor")
+		svg.setAttribute("stroke-width", "2")
+		svg.setAttribute("stroke-linecap", "round")
+		svg.setAttribute("stroke-linejoin", "round")
+		svg.setAttribute("aria-hidden", "true")
+		svg.setAttribute("class", "sk-icon")
+		const path = document.createElementNS(SVG_NS, "path")
+		path.setAttribute("d", ICONS[name] ?? ICONS.info)
+		svg.appendChild(path)
+		return svg
+	}
+
+	function setButtonContent(button, iconName, text) {
+		button.textContent = ""
+		if (iconName) button.appendChild(icon(iconName, 13))
+		if (text) {
+			const label = document.createElement("span")
+			label.textContent = text
+			button.appendChild(label)
+		}
+		return button
+	}
+
 	function el(tag, className) {
 		const node = document.createElement(tag)
 		if (className) node.className = className
@@ -67,24 +220,39 @@
 		return node
 	}
 
+	function skButton(iconName, text, title, variant = "") {
+		const button = el("button", `sk-btn${variant ? ` sk-btn-${variant}` : ""}`)
+		button.type = "button"
+		if (title) button.title = title
+		return setButtonContent(button, iconName, text)
+	}
+
 	let shadowHost = null
 	let shadowRoot = null
+	let styledRoot = null
+
+	function removeLegacyHosts() {
+		for (const id of [LEGACY_HOST_ID, HOST_ID]) {
+			const stale = document.getElementById(id)
+			if (stale && stale !== shadowHost && stale.dataset?.sidekickCore !== CORE_TOKEN) stale.remove()
+		}
+	}
 
 	function getShadowRoot() {
-		if (!shadowHost || !shadowHost.parentNode) {
-			shadowHost = document.getElementById("devkit-shadow-host")
-			if (!shadowHost) {
-				shadowHost = document.createElement("div")
-				shadowHost.id = "devkit-shadow-host"
-				;(document.body || document.documentElement).appendChild(shadowHost)
-			}
+		if (!shadowHost || !shadowHost.isConnected) {
+			removeLegacyHosts()
+			shadowHost = document.createElement("div")
+			shadowHost.id = HOST_ID
+			shadowHost.dataset.sidekickCore = CORE_TOKEN
 			shadowHost.classList.add("dk-root")
-			shadowHost.style.cssText = "all: initial !important; position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important; z-index: 2147483647 !important; pointer-events: none !important; border: none !important; margin: 0 !important; padding: 0 !important; display: block !important; overflow: visible !important;"
+			shadowHost.style.cssText = "all: initial !important; position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important; z-index: 2147483647 !important; pointer-events: none !important; border: none !important; margin: 0 !important; padding: 0 !important; display: block !important; overflow: visible !important; contain: layout style !important;"
+			;(document.documentElement || document.body).appendChild(shadowHost)
 			try {
-				shadowRoot = shadowHost.shadowRoot || shadowHost.attachShadow({ mode: "open" })
+				shadowRoot = shadowHost.attachShadow({ mode: "closed" })
 			} catch {
 				shadowRoot = shadowHost
 			}
+			styledRoot = null
 		}
 		ensureStyles()
 		return shadowRoot
@@ -93,497 +261,349 @@
 	function isDevKitNode(node) {
 		if (!node) return false
 		if (node === shadowHost || node === shadowRoot) return true
-		if (shadowHost && (shadowHost === node || shadowHost.contains(node))) return true
+		if (shadowHost && typeof node.nodeType === "number" && shadowHost.contains(node)) return true
 		if (shadowRoot && typeof node.getRootNode === "function" && node.getRootNode() === shadowRoot) return true
-		const id = typeof node.id === "string" ? node.id : (node.id?.baseVal || node.getAttribute?.("id") || "")
-		if (id === "devkit-shadow-host") return true
-		return false
+		const id = typeof node.id === "string" ? node.id : ""
+		return id === HOST_ID || id === LEGACY_HOST_ID
 	}
 
 	function isDevKitEvent(event) {
 		if (!event) return false
 		try {
 			const path = typeof event.composedPath === "function" ? event.composedPath() : []
-			for (const el of path) {
-				if (isDevKitNode(el)) return true
+			for (const item of path) {
+				if (isDevKitNode(item)) return true
 			}
 			const target = event.target instanceof Element ? event.target : event.target?.parentElement
 			if (isDevKitNode(target)) return true
-		} catch {
+		} catch {}
+		return false
+	}
 
+	// Page-level rules (outline-all, filled fields, overflow culprits) live in content/overlay.css,
+	// which the extension inserts with scripting.insertCSS. If that failed, fall back to a <style>.
+	function ensurePageStyles() {
+		try {
+			if (getComputedStyle(document.documentElement).getPropertyValue("--sidekick-page-css").trim()) return
+		} catch {}
+		if (document.getElementById("sidekick-page-styles")) return
+		const pageStyle = document.createElement("style")
+		pageStyle.id = "sidekick-page-styles"
+		pageStyle.textContent = `
+			.dk-field-filled { outline: 2px solid #14b8a6 !important; outline-offset: 1px !important; }
+			.dk-outline-all body *:not(#${HOST_ID}) { outline: 1px solid rgba(255, 90, 31, 0.45) !important; }
+			.dk-overflow-culprit { outline: 2px dashed #ff4d4d !important; outline-offset: 1px !important; box-shadow: 0 0 10px rgba(255, 77, 77, 0.6) !important; }
+		`
+		;(document.head || document.documentElement).appendChild(pageStyle)
+		coreTeardowns.push(() => pageStyle.remove())
+	}
+
+	const OVERLAY_CSS = `
+		:host {
+			all: initial !important;
+			position: fixed !important;
+			inset: 0 !important;
+			width: 100vw !important;
+			height: 100vh !important;
+			z-index: 2147483647 !important;
+			pointer-events: none !important;
+			display: block !important;
+			overflow: visible !important;
+		}
+		:host, .dk-root {
+			--sk-ink: #17140f;
+			--sk-ink-2: #221e18;
+			--sk-ink-3: #2e2820;
+			--sk-line: rgba(243, 236, 224, 0.12);
+			--sk-line-strong: rgba(243, 236, 224, 0.22);
+			--sk-text: #f3ece0;
+			--sk-muted: #b3a894;
+			--sk-dim: #857a68;
+			--sk-accent: #ff5a1f;
+			--sk-accent-soft: rgba(255, 90, 31, 0.16);
+			--sk-teal: #14b8a6;
+			--sk-teal-soft: rgba(20, 184, 166, 0.16);
+			--sk-warn: #f5b13d;
+			--sk-bad: #ff4d4d;
+			--sk-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+			--sk-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+		}
+		*, *::before, *::after {
+			box-sizing: border-box;
+			font-family: var(--sk-sans);
+		}
+		.sk-icon { flex: none; display: inline-block; vertical-align: -2px; }
+		button { font: inherit; }
+		.sk-btn {
+			display: inline-flex; align-items: center; gap: 5px;
+			background: var(--sk-ink-3); color: var(--sk-text);
+			border: 1px solid var(--sk-line-strong); border-radius: 10px;
+			padding: 5px 10px; font-size: 11.5px; font-weight: 600; line-height: 1.2;
+			cursor: pointer; white-space: nowrap; pointer-events: auto;
+		}
+		.sk-btn:hover { border-color: var(--sk-accent); color: #fff; }
+		.sk-btn:focus-visible { outline: 2px solid var(--sk-accent); outline-offset: 1px; }
+		.sk-btn-accent { background: var(--sk-accent); border-color: var(--sk-accent); color: #1a0d05; }
+		.sk-btn-accent:hover { color: #1a0d05; filter: brightness(1.08); }
+		.sk-btn-ghost { background: transparent; }
+		.sk-btn-danger { color: #ffb3a3; border-color: rgba(255, 77, 77, 0.45); background: rgba(255, 77, 77, 0.12); }
+		.sk-btn-danger:hover { border-color: var(--sk-bad); color: #fff; }
+		.sk-btn-icon { padding: 5px; }
+		.dk-snip-overlay {
+			position: fixed; inset: 0; width: 100vw; height: 100vh;
+			z-index: 2147483646; pointer-events: auto; cursor: crosshair;
+			background: rgba(10, 8, 5, 0.32); outline: none; user-select: none; -webkit-user-select: none;
+		}
+		.dk-snip-region {
+			position: fixed; z-index: 2147483647;
+			border: 2px solid var(--sk-accent); background: rgba(255, 90, 31, 0.08);
+			box-shadow: 0 0 0 9999px rgba(10, 8, 5, 0.45); pointer-events: none;
+		}
+		.dk-snip-dims {
+			position: absolute; bottom: -26px; left: 50%; transform: translateX(-50%);
+			background: var(--sk-ink); color: var(--sk-text); padding: 2px 8px; border-radius: 10px;
+			font-size: 11px; font-family: var(--sk-mono); white-space: nowrap; pointer-events: none;
+		}
+		.dk-cta-esc-badge {
+			background: var(--sk-ink-3); color: var(--sk-text); border: 1px solid var(--sk-line-strong);
+			border-radius: 6px; padding: 1px 6px; font-size: 11px; font-family: var(--sk-mono); font-weight: 700;
+			cursor: pointer; display: inline-block; margin: 0 3px; line-height: 1.3; vertical-align: baseline;
+		}
+		.dk-cta-esc-badge:hover { border-color: var(--sk-accent); color: #fff; }
+		.dk-highlight {
+			position: fixed; z-index: 2147483645; pointer-events: none;
+			border: 1.5px solid var(--sk-accent); background: rgba(255, 90, 31, 0.08); border-radius: 3px;
+		}
+		.dk-hud {
+			position: fixed; z-index: 2147483646; bottom: 20px; right: 20px;
+			width: 360px; max-width: calc(100vw - 32px); max-height: 75vh; overflow: auto;
+			background: var(--sk-ink); color: var(--sk-text);
+			border: 1px solid var(--sk-line-strong); border-radius: 12px; padding: 12px 14px;
+			font-size: 12px; box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55); pointer-events: auto;
+		}
+		.dk-floating-cta-bar {
+			position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+			z-index: 2147483647; pointer-events: auto; width: max-content; max-width: calc(100vw - 32px);
+			animation: dkFadeUp 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+		}
+		@keyframes dkFadeUp {
+			from { opacity: 0; transform: translate(-50%, 12px); }
+			to { opacity: 1; transform: translate(-50%, 0); }
+		}
+		.dk-cta-pill {
+			display: flex; align-items: center; gap: 10px;
+			background: var(--sk-ink); color: var(--sk-text);
+			border: 1px solid var(--sk-line-strong); border-radius: 12px;
+			padding: 6px 6px 6px 12px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+			font-size: 12.5px; line-height: 1.2; white-space: nowrap; overflow-x: auto; max-width: calc(100vw - 32px);
+		}
+		.dk-cta-dot {
+			width: 8px; height: 8px; border-radius: 50%; background: var(--sk-accent);
+			box-shadow: 0 0 0 3px var(--sk-accent-soft); flex-shrink: 0;
+		}
+		.dk-cta-title { font-weight: 700; color: var(--sk-text); white-space: nowrap; }
+		.dk-cta-info { color: var(--sk-muted); font-size: 12px; white-space: nowrap; border-left: 1px solid var(--sk-line); padding-left: 10px; }
+		.dk-cta-close-btn { margin-left: 2px; }
+		.dk-grid {
+			position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 2147483644; pointer-events: none;
+			background-image: linear-gradient(to right, rgba(255, 90, 31, 0.16) 1px, transparent 1px),
+				linear-gradient(to bottom, rgba(20, 184, 166, 0.14) 1px, transparent 1px);
+			background-size: 8px 8px, 8px 8px;
+		}
+		.dk-grid-12col {
+			position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 2147483644; pointer-events: none;
+			display: flex; justify-content: center; padding: 0 24px;
+		}
+		.dk-grid-12col-inner { width: 100%; max-width: 1280px; height: 100%; display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
+		.dk-grid-12col-col { background: rgba(255, 90, 31, 0.07); border-left: 1px solid rgba(255, 90, 31, 0.3); border-right: 1px solid rgba(255, 90, 31, 0.3); height: 100%; }
+		.dk-drawer-overlay {
+			position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 2147483640;
+			background: rgba(10, 8, 5, 0.45); pointer-events: auto;
+		}
+		.dk-drawer-panel {
+			position: fixed; top: 0; right: 0; bottom: 0; width: 520px; max-width: 92vw; height: 100vh;
+			z-index: 2147483645; background: var(--sk-ink); color: var(--sk-text);
+			border-left: 1px solid var(--sk-line-strong); box-shadow: -16px 0 44px rgba(0, 0, 0, 0.55);
+			display: flex; flex-direction: column; overflow: hidden; pointer-events: auto;
+		}
+		.dk-badge {
+			position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 2147483647;
+			pointer-events: auto;
+		}
+		.dk-pulse-box {
+			position: fixed; z-index: 2147483646; pointer-events: none;
+			border: 2px solid var(--sk-accent); background: rgba(255, 90, 31, 0.12); border-radius: 4px;
+			box-shadow: 0 0 0 4px rgba(255, 90, 31, 0.18);
+			animation: skFlash 0.9s ease-in-out 3;
+		}
+		.dk-pulse-label {
+			position: absolute; top: -24px; left: -2px; max-width: 420px; overflow: hidden; text-overflow: ellipsis;
+			background: var(--sk-accent); color: #1a0d05; font: 700 11px/1.5 var(--sk-mono);
+			padding: 1px 8px; border-radius: 6px; white-space: nowrap;
+		}
+		@keyframes skFlash { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+		.sk-measure-svg { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 2147483645; overflow: visible; }
+		.sk-measure-label {
+			position: fixed; z-index: 2147483646; pointer-events: none; transform: translate(-50%, -50%);
+			background: var(--sk-accent); color: #1a0d05; font: 700 11px/1.4 var(--sk-mono);
+			padding: 1px 6px; border-radius: 6px; white-space: nowrap;
+		}
+		.sk-measure-label.sk-size { background: var(--sk-ink); color: var(--sk-text); border: 1px solid var(--sk-line-strong); transform: translate(-50%, 0); }
+		.sk-measure-label.sk-anchor { background: var(--sk-teal); color: #031512; }
+		.sk-report { display: grid; gap: 8px; }
+		.sk-report-row { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+		.sk-report-row b { font: 700 12px var(--sk-mono); }
+		.sk-tone-good { color: var(--sk-teal); }
+		.sk-tone-warn { color: var(--sk-warn); }
+		.sk-tone-bad { color: var(--sk-bad); }
+		.sk-tone-info { color: var(--sk-muted); }
+		.dk-edit-toolbar { pointer-events: auto; }
+		.dk-edit-handle {
+			position: absolute; width: 8px; height: 8px; background: var(--sk-text);
+			border: 2px solid var(--sk-accent); border-radius: 2px; pointer-events: none;
+		}
+		.dk-edit-handle-tl { top: -5px; left: -5px; }
+		.dk-edit-handle-tr { top: -5px; right: -5px; }
+		.dk-edit-handle-bl { bottom: -5px; left: -5px; }
+		.dk-edit-handle-br { bottom: -5px; right: -5px; }
+		@keyframes dkPulse {
+			0%, 100% { opacity: 0.95; }
+			50% { opacity: 0.5; }
+		}
+	`
+
+	function ensureStyles() {
+		const root = shadowRoot
+		if (!root || styledRoot === root) return
+		styledRoot = root
+		try {
+			if (root !== shadowHost && "adoptedStyleSheets" in root && typeof CSSStyleSheet === "function") {
+				const sheet = new CSSStyleSheet()
+				sheet.replaceSync(OVERLAY_CSS)
+				root.adoptedStyleSheets = [sheet]
+				return
+			}
+		} catch {}
+		const styleEl = document.createElement("style")
+		styleEl.textContent = OVERLAY_CSS
+		root.appendChild(styleEl)
+	}
+
+
+	function rafThrottle(fn) {
+		let frame = 0
+		let lastArgs = null
+		const wrapped = (...args) => {
+			lastArgs = args
+			if (frame) return
+			frame = requestAnimationFrame(() => {
+				frame = 0
+				const pending = lastArgs
+				lastArgs = null
+				if (pending) fn(...pending)
+			})
+		}
+		wrapped.cancel = () => {
+			if (frame) cancelAnimationFrame(frame)
+			frame = 0
+			lastArgs = null
+		}
+		return wrapped
+	}
+
+	// Walk a capped list of elements with a time budget so whole-page scans never stall the page.
+	function scanElements(selector, visit, { limit = 5000, ms = 350, root = document } = {}) {
+		let list
+		try {
+			list = root.querySelectorAll(selector)
+		} catch {
+			return { scanned: 0, total: 0, truncated: false }
+		}
+		const deadline = performance.now() + ms
+		let i = 0
+		for (; i < list.length && i < limit; i++) {
+			if ((i & 63) === 63 && performance.now() > deadline) break
+			if (visit(list[i], i) === false) {
+				i++
+				break
+			}
+		}
+		return { scanned: i, total: list.length, truncated: i < list.length }
+	}
+
+	function hasOwnText(node) {
+		for (let child = node.firstChild; child; child = child.nextSibling) {
+			if (child.nodeType === 3 && child.data.trim()) return true
 		}
 		return false
 	}
 
-	function ensureStyles() {
-		const root = shadowRoot || shadowHost
-		if (!root) return
-		let styleEl = root.querySelector("#dk-injected-styles")
-		if (!styleEl) {
-			styleEl = document.createElement("style")
-			styleEl.id = "dk-injected-styles"
-			root.appendChild(styleEl)
+	function isRendered(node) {
+		return node.getClientRects().length > 0
+	}
+
+	const activeCleanups = new Map()
+	function registerCleanup(name, fn) {
+		activeCleanups.set(name, fn)
+	}
+	function runCleanup(name) {
+		const fn = activeCleanups.get(name)
+		activeCleanups.delete(name)
+		try {
+			fn?.()
+		} catch {}
+	}
+
+	function report(summary, sections) {
+		return { type: "report", value: { summary, sections: sections.filter((section) => section.items.length) } }
+	}
+
+	// Resolves selectors produced by cssPath, including " >>> " hops into open shadow roots.
+	function queryDeep(selector) {
+		const hops = String(selector).split(" >>> ")
+		let scope = document
+		let found = null
+		for (let i = 0; i < hops.length; i++) {
+			found = scope.querySelector(hops[i])
+			if (!found) return null
+			if (i < hops.length - 1) {
+				scope = found.shadowRoot
+				if (!scope) return null
+			}
 		}
-		if (!document.getElementById("dk-injected-page-styles")) {
-			const pageStyle = document.createElement("style")
-			pageStyle.id = "dk-injected-page-styles"
-			pageStyle.textContent = `
-				.dk-field-filled { outline: 2px solid #3b82f6 !important; outline-offset: 1px !important; }
-				.dk-outline-all *:not(.dk-root):not(.dk-root *) { outline: 1px solid rgba(229, 100, 88, 0.45) !important; }
-				.dk-overflow-culprit { outline: 2px dashed #ef4444 !important; outline-offset: 1px !important; box-shadow: 0 0 10px rgba(239, 68, 68, 0.7) !important; }
-			`
-			;(document.head || document.documentElement).appendChild(pageStyle)
-		}
-		styleEl.textContent = `
-			:host {
-				all: initial !important;
-				position: fixed !important;
-				inset: 0 !important;
-				width: 100vw !important;
-				height: 100vh !important;
-				z-index: 2147483647 !important;
-				pointer-events: none !important;
-				display: block !important;
-				overflow: visible !important;
-			}
-			*, *::before, *::after {
-				box-sizing: border-box !important;
-				font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
-			}
-			.dk-snip-overlay {
-				position: fixed !important;
-				inset: 0 !important;
-				width: 100vw !important;
-				height: 100vh !important;
-				z-index: 2147483646 !important;
-				pointer-events: auto !important;
-				cursor: crosshair !important;
-				background: rgba(0, 0, 0, 0.3) !important;
-				outline: none !important;
-				user-select: none !important;
-				-webkit-user-select: none !important;
-			}
-			.dk-snip-region {
-				position: fixed !important;
-				z-index: 2147483647 !important;
-				border: 2px solid #3b82f6 !important;
-				background: rgba(59, 130, 246, 0.12) !important;
-				box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45) !important;
-				pointer-events: none !important;
-			}
-			.dk-snip-dims {
-				position: absolute !important;
-				bottom: -24px !important;
-				left: 50% !important;
-				transform: translateX(-50%) !important;
-				background: rgba(15, 23, 42, 0.92) !important;
-				color: #f8fafc !important;
-				padding: 2px 8px !important;
-				border-radius: 4px !important;
-				font-size: 11px !important;
-				font-family: ui-monospace, SFMono-Regular, monospace !important;
-				white-space: nowrap !important;
-				pointer-events: none !important;
-			}
-			.dk-cta-esc-badge {
-				all: initial !important;
-				background: rgba(255, 255, 255, 0.18) !important;
-				color: #f8fafc !important;
-				border: 1px solid rgba(255, 255, 255, 0.35) !important;
-				border-radius: 4px !important;
-				padding: 1px 6px !important;
-				font-size: 11px !important;
-				font-family: ui-monospace, monospace !important;
-				font-weight: 700 !important;
-				cursor: pointer !important;
-				display: inline-block !important;
-				margin: 0 3px !important;
-				line-height: 1.2 !important;
-				transition: all 0.15s ease !important;
-				vertical-align: baseline !important;
-			}
-			.dk-cta-esc-badge:hover {
-				background: rgba(239, 68, 68, 0.5) !important;
-				border-color: #ef4444 !important;
-				color: #ffffff !important;
-			}
-			.dk-highlight {
-				position: fixed !important;
-				z-index: 2147483645 !important;
-				pointer-events: none !important;
-				border: 2px solid #3b82f6 !important;
-				background: rgba(59, 130, 246, 0.18) !important;
-				border-radius: 3px !important;
-				box-shadow: 0 0 0 1px rgba(255,255,255,0.7), 0 0 16px rgba(59,130,246,0.5) !important;
-				transition: none !important;
-			}
-			.dk-hud {
-				position: fixed !important;
-				z-index: 2147483646 !important;
-				bottom: 20px !important;
-				right: 20px !important;
-				width: 360px !important;
-				max-width: calc(100vw - 40px) !important;
-				max-height: 75vh !important;
-				overflow: auto !important;
-				background: rgba(15, 23, 42, 0.96) !important;
-				backdrop-filter: blur(16px) !important;
-				-webkit-backdrop-filter: blur(16px) !important;
-				color: #f8fafc !important;
-				border: 1px solid rgba(59, 130, 246, 0.4) !important;
-				border-radius: 12px !important;
-				padding: 14px 16px !important;
-				font-size: 12px !important;
-				box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.08) !important;
-				pointer-events: auto !important;
-			}
-			.dk-floating-cta-bar {
-				position: fixed !important;
-				bottom: 24px !important;
-				left: 50% !important;
-				transform: translateX(-50%) !important;
-				z-index: 2147483647 !important;
-				pointer-events: auto !important;
-				width: max-content !important;
-				max-width: 90vw !important;
-				animation: dkFadeUp 0.25s cubic-bezier(0.16, 1, 0.3, 1) !important;
-			}
-			@keyframes dkFadeUp {
-				from { opacity: 0; transform: translate(-50%, 14px); }
-				to { opacity: 1; transform: translate(-50%, 0); }
-			}
-			.dk-cta-pill {
-				display: flex !important;
-				align-items: center !important;
-				gap: 12px !important;
-				background: rgba(15, 23, 42, 0.94) !important;
-				backdrop-filter: blur(16px) !important;
-				-webkit-backdrop-filter: blur(16px) !important;
-				color: #f8fafc !important;
-				border: 1px solid rgba(59, 130, 246, 0.4) !important;
-				border-radius: 9999px !important;
-				padding: 8px 14px 8px 18px !important;
-				box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.08) !important;
-				font-size: 13px !important;
-				line-height: 1 !important;
-				white-space: nowrap !important;
-			}
-			.dk-cta-dot {
-				width: 8px !important;
-				height: 8px !important;
-				border-radius: 50% !important;
-				background: #3b82f6 !important;
-				box-shadow: 0 0 10px #3b82f6 !important;
-				animation: dkPulse 1.8s infinite !important;
-				flex-shrink: 0 !important;
-			}
-			.dk-cta-title { font-weight: 600 !important; color: #ffffff !important; white-space: nowrap !important; }
-			.dk-cta-info { color: #94a3b8 !important; font-size: 12px !important; white-space: nowrap !important; border-left: 1px solid rgba(255, 255, 255, 0.15) !important; padding-left: 10px !important; }
-			.dk-cta-close-btn {
-				background: rgba(239, 68, 68, 0.2) !important;
-				color: #fca5a5 !important;
-				border: 1px solid rgba(239, 68, 68, 0.4) !important;
-				border-radius: 9999px !important;
-				padding: 5px 12px !important;
-				font-size: 12px !important;
-				font-weight: 600 !important;
-				cursor: pointer !important;
-				margin-left: 6px !important;
-				display: inline-flex !important;
-				align-items: center !important;
-				gap: 4px !important;
-				line-height: 1.2 !important;
-				transition: all 0.15s ease !important;
-			}
-			.dk-cta-close-btn:hover { background: rgba(239, 68, 68, 0.4) !important; color: #ffffff !important; border-color: #ef4444 !important; }
-			.dk-grid {
-				position: fixed !important;
-				inset: 0 !important;
-				width: 100vw !important;
-				height: 100vh !important;
-				z-index: 2147483644 !important;
-				pointer-events: none !important;
-				background-image: linear-gradient(to right, rgba(39, 131, 222, 0.18) 1px, transparent 1px),
-					linear-gradient(to bottom, rgba(39, 131, 222, 0.12) 1px, transparent 1px) !important;
-				background-size: 8px 8px, 8px 8px !important;
-			}
-			.dk-grid-12col {
-				position: fixed !important;
-				inset: 0 !important;
-				width: 100vw !important;
-				height: 100vh !important;
-				z-index: 2147483644 !important;
-				pointer-events: none !important;
-				display: flex !important;
-				justify-content: center !important;
-				padding: 0 24px !important;
-				box-sizing: border-box !important;
-			}
-			.dk-grid-12col-inner {
-				width: 100% !important;
-				max-width: 1280px !important;
-				height: 100% !important;
-				display: grid !important;
-				grid-template-columns: repeat(12, 1fr) !important;
-				gap: 16px !important;
-			}
-			.dk-grid-12col-col {
-				background: rgba(37, 99, 235, 0.08) !important;
-				border-left: 1px solid rgba(37, 99, 235, 0.25) !important;
-				border-right: 1px solid rgba(37, 99, 235, 0.25) !important;
-				height: 100% !important;
-			}
-			.dk-drawer-overlay {
-				position: fixed !important;
-				inset: 0 !important;
-				width: 100vw !important;
-				height: 100vh !important;
-				z-index: 2147483640 !important;
-				background: rgba(0, 0, 0, 0.5) !important;
-				backdrop-filter: blur(4px) !important;
-				pointer-events: auto !important;
-			}
-			.dk-drawer-panel {
-				position: fixed !important;
-				top: 0 !important;
-				right: 0 !important;
-				bottom: 0 !important;
-				width: 520px !important;
-				max-width: 90vw !important;
-				height: 100vh !important;
-				z-index: 2147483645 !important;
-				background: #0e121a !important;
-				border-left: 1px solid rgba(255, 255, 255, 0.1) !important;
-				box-shadow: -12px 0 40px rgba(0, 0, 0, 0.6) !important;
-				display: flex !important;
-				flex-direction: column !important;
-				overflow: hidden !important;
-				pointer-events: auto !important;
-			}
-			.dk-drawer-frame {
-				width: 100% !important;
-				height: 100% !important;
-				border: none !important;
-				background: transparent !important;
-			}
-			.dk-field-filled { outline: 2px solid #3b82f6 !important; outline-offset: 1px !important; }
-			.dk-outline-all *:not(.dk-root):not(.dk-root *) { outline: 1px solid rgba(229, 100, 88, 0.45) !important; }
-			.dk-badge {
-				position: fixed !important;
-				top: 16px !important;
-				left: 50% !important;
-				transform: translateX(-50%) !important;
-				z-index: 2147483647 !important;
-				display: inline-flex !important;
-				align-items: center !important;
-				gap: 10px !important;
-				background: rgba(15, 23, 42, 0.95) !important;
-				backdrop-filter: blur(16px) !important;
-				-webkit-backdrop-filter: blur(16px) !important;
-				border: 1px solid rgba(59, 130, 246, 0.5) !important;
-				border-radius: 9999px !important;
-				padding: 7px 16px !important;
-				box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.1) !important;
-				font-size: 13px !important;
-				font-weight: 500 !important;
-				color: #ffffff !important;
-				pointer-events: auto !important;
-				line-height: 1 !important;
-				white-space: nowrap !important;
-				animation: dkFadeDown 0.25s cubic-bezier(0.16, 1, 0.3, 1) !important;
-			}
-			@keyframes dkFadeDown {
-				from { opacity: 0; transform: translate(-50%, -10px); }
-				to { opacity: 1; transform: translate(-50%, 0); }
-			}
-			.dk-badge-dot {
-				width: 8px !important;
-				height: 8px !important;
-				border-radius: 50% !important;
-				background: #10b981 !important;
-				box-shadow: 0 0 8px #10b981 !important;
-				animation: dkPulse 1.8s infinite !important;
-				flex-shrink: 0 !important;
-			}
-			.dk-badge-dims {
-				font-weight: 700 !important;
-				font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
-				color: #ffffff !important;
-				font-size: 13.5px !important;
-				letter-spacing: 0.3px !important;
-			}
-			.dk-badge-tag {
-				background: rgba(59, 130, 246, 0.2) !important;
-				border: 1px solid rgba(59, 130, 246, 0.45) !important;
-				color: #93c5fd !important;
-				border-radius: 9999px !important;
-				padding: 2px 8px !important;
-				font-size: 11px !important;
-				font-weight: 600 !important;
-				text-transform: uppercase !important;
-				letter-spacing: 0.5px !important;
-			}
-			.dk-badge-dpr {
-				color: #94a3b8 !important;
-				font-size: 12px !important;
-				border-left: 1px solid rgba(255, 255, 255, 0.15) !important;
-				padding-left: 8px !important;
-			}
-			.dk-badge-close {
-				background: rgba(239, 68, 68, 0.15) !important;
-				border: 1px solid rgba(239, 68, 68, 0.3) !important;
-				border-radius: 9999px !important;
-				color: #fca5a5 !important;
-				cursor: pointer !important;
-				font-size: 11px !important;
-				font-weight: 700 !important;
-				padding: 2px 6px !important;
-				line-height: 1 !important;
-				margin-left: 4px !important;
-				transition: all 0.15s ease !important;
-			}
-			.dk-badge-close:hover {
-				background: rgba(239, 68, 68, 0.35) !important;
-				color: #ffffff !important;
-				border-color: #ef4444 !important;
-			}
-			.dk-edit-hover {
-				outline: 2px dashed rgba(59, 130, 246, 0.75) !important;
-				outline-offset: 2px !important;
-				cursor: grab !important;
-			}
-			.dk-edit-selected {
-				position: fixed !important;
-				z-index: 2147483645 !important;
-				pointer-events: auto !important;
-				border: 2px solid #3b82f6 !important;
-				background: rgba(59, 130, 246, 0.08) !important;
-				border-radius: 2px !important;
-				box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.6), 0 0 20px rgba(59, 130, 246, 0.45) !important;
-				cursor: grab !important;
-			}
-			.dk-edit-selected.dk-dragging {
-				cursor: grabbing !important;
-			}
-			.dk-edit-handle {
-				position: absolute !important;
-				width: 8px !important;
-				height: 8px !important;
-				background: #ffffff !important;
-				border: 2px solid #3b82f6 !important;
-				border-radius: 1px !important;
-				pointer-events: none !important;
-			}
-			.dk-edit-handle-tl { top: -5px !important; left: -5px !important; }
-			.dk-edit-handle-tr { top: -5px !important; right: -5px !important; }
-			.dk-edit-handle-bl { bottom: -5px !important; left: -5px !important; }
-			.dk-edit-handle-br { bottom: -5px !important; right: -5px !important; }
-			.dk-edit-toolbar {
-				position: fixed !important;
-				z-index: 2147483646 !important;
-				display: flex !important;
-				align-items: center !important;
-				gap: 4px !important;
-				background: rgba(15, 23, 42, 0.96) !important;
-				backdrop-filter: blur(16px) !important;
-				border: 1px solid rgba(59, 130, 246, 0.5) !important;
-				border-radius: 8px !important;
-				padding: 4px 8px !important;
-				box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.08) !important;
-				font-size: 11.5px !important;
-				pointer-events: auto !important;
-				animation: dkFadeUp 0.18s ease-out !important;
-			}
-			.dk-edit-btn {
-				background: rgba(255, 255, 255, 0.08) !important;
-				color: #f1f5f9 !important;
-				border: 1px solid rgba(255, 255, 255, 0.15) !important;
-				border-radius: 4px !important;
-				padding: 3px 8px !important;
-				font-size: 11px !important;
-				cursor: pointer !important;
-				font-weight: 500 !important;
-				display: inline-flex !important;
-				align-items: center !important;
-				gap: 3px !important;
-				user-select: none !important;
-				line-height: 1.2 !important;
-				transition: all 0.15s ease !important;
-			}
-			.dk-edit-btn:hover {
-				background: rgba(59, 130, 246, 0.3) !important;
-				border-color: #3b82f6 !important;
-				color: #fff !important;
-			}
-			.dk-edit-btn.dk-drag-grip {
-				cursor: grab !important;
-				background: rgba(59, 130, 246, 0.2) !important;
-				border-color: rgba(59, 130, 246, 0.5) !important;
-				color: #93c5fd !important;
-			}
-			.dk-edit-btn.dk-drag-grip:active {
-				cursor: grabbing !important;
-			}
-			.dk-edit-btn.dk-delete:hover {
-				background: rgba(239, 68, 68, 0.3) !important;
-				border-color: #ef4444 !important;
-				color: #fca5a5 !important;
-			}
-			.dk-edit-tag-label {
-				color: #60a5fa !important;
-				font-weight: 700 !important;
-				font-size: 11px !important;
-				text-transform: uppercase !important;
-				padding: 2px 6px !important;
-				font-family: ui-monospace, SFMono-Regular, monospace !important;
-				letter-spacing: 0.3px !important;
-			}
-			.dk-drop-indicator {
-				position: fixed !important;
-				z-index: 2147483645 !important;
-				pointer-events: none !important;
-				height: 4px !important;
-				background: #3b82f6 !important;
-				border-radius: 2px !important;
-				box-shadow: 0 0 10px #3b82f6 !important;
-			}
-			@keyframes dkPulse {
-				0%, 100% { opacity: 0.95; transform: scale(1); }
-				50% { opacity: 0.45; transform: scale(1.02); }
-			}
-		`
-		root.appendChild(styleEl)
+		return found
 	}
 
 	function showHud(title, body, actionLabel, action) {
-		ensureStyles()
-		if (!hud || !hud.parentNode) {
+		const root = getShadowRoot()
+		if (!hud || !hud.isConnected) {
 			hud = el("div", "dk-hud")
-			getShadowRoot().appendChild(hud)
+			root.appendChild(hud)
 		}
-		hud.innerHTML = ""
+		hud.textContent = ""
+		hud.style.cssText = ""
 		const heading = el("h4")
 		heading.textContent = title
-		heading.style.cssText = "margin: 0 0 8px 0 !important; font-size: 12px !important; color: #60a5fa !important; text-transform: uppercase !important; letter-spacing: 0.05em !important; font-weight: 700 !important;"
+		heading.style.cssText = "margin: 0 0 8px 0 !important; font-size: 11px !important; color: #ff8a5c !important; text-transform: uppercase !important; letter-spacing: 0.08em !important; font-weight: 700 !important;"
 		hud.appendChild(heading)
 
-		const pre = el("div")
-		pre.style.cssText = "white-space: pre-wrap !important; word-break: break-word !important; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important; font-size: 11.5px !important; line-height: 1.45 !important; color: #e2e8f0 !important;"
-		pre.textContent = typeof body === "string" ? body : JSON.stringify(body, null, 2)
-		hud.appendChild(pre)
+		if (body instanceof Node) {
+			hud.appendChild(body)
+		} else {
+			const pre = el("div")
+			pre.style.cssText = "white-space: pre-wrap !important; word-break: break-word !important; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important; font-size: 11.5px !important; line-height: 1.45 !important; color: #f3ece0 !important;"
+			pre.textContent = typeof body === "string" ? body : JSON.stringify(body, null, 2)
+			hud.appendChild(pre)
+		}
 
 		const actionsRow = el("div")
 		actionsRow.style.cssText = "display: flex !important; gap: 8px !important; margin-top: 10px !important; justify-content: flex-end !important;"
 		if (actionLabel && action) {
-			const extra = el("button")
-			extra.textContent = actionLabel
-			extra.style.cssText = "background: rgba(59, 130, 246, 0.2) !important; color: #93c5fd !important; border: 1px solid rgba(59, 130, 246, 0.4) !important; border-radius: 6px !important; padding: 4px 10px !important; font-size: 11.5px !important; cursor: pointer !important;"
+			const extra = skButton("copy", actionLabel, actionLabel)
 			extra.addEventListener("click", action)
 			actionsRow.appendChild(extra)
 		}
-		const close = el("button")
-		close.textContent = "✕ Close"
-		close.style.cssText = "background: rgba(255, 255, 255, 0.1) !important; color: #cbd5e1 !important; border: 1px solid rgba(255, 255, 255, 0.2) !important; border-radius: 6px !important; padding: 4px 10px !important; font-size: 11.5px !important; cursor: pointer !important;"
+		const close = skButton("close", "Close", "Close", "ghost")
 		close.addEventListener("click", hideHud)
 		actionsRow.appendChild(close)
 		hud.appendChild(actionsRow)
@@ -594,16 +614,26 @@
 		hud = null
 	}
 
+	// Compact on-page summary for reports triggered from the context menu or a shortcut.
+	function showReportHud(title, rows, copyText) {
+		const list = el("div", "sk-report")
+		for (const row of rows) {
+			const line = el("div", "sk-report-row")
+			const label = el("span")
+			label.textContent = row.label
+			const value = el("b", `sk-tone-${row.tone ?? "info"}`)
+			value.textContent = String(row.value)
+			line.append(label, value)
+			list.appendChild(line)
+		}
+		showHud(title, list, copyText ? "Copy JSON" : null, copyText ? () => copy(copyText) : null)
+	}
+
 	let floatingCta = null
-	function showFloatingCta(title, info, onClose, extraActions = null) {
-		ensureStyles()
-		hideFloatingCta()
-		floatingCta = el("div", "dk-floating-cta-bar dk-root")
-		const pill = el("div", "dk-cta-pill")
-		const dot = el("span", "dk-cta-dot")
-		const titleEl = el("span", "dk-cta-title")
-		titleEl.textContent = title
-		const infoEl = el("span", "dk-cta-info")
+	let floatingCtaClose = null
+
+	function appendCtaInfo(infoEl, info, onClose) {
+		infoEl.textContent = ""
 		if (typeof info === "string" && info.includes("Esc to cancel")) {
 			const parts = info.split("Esc to cancel")
 			if (parts[0]) infoEl.appendChild(document.createTextNode(parts[0]))
@@ -615,6 +645,7 @@
 				e.preventDefault()
 				e.stopPropagation()
 				if (typeof onClose === "function") onClose()
+				else if (typeof activeSnipCancel === "function") activeSnipCancel()
 				hideFloatingCta()
 			})
 			infoEl.appendChild(escBadge)
@@ -622,173 +653,168 @@
 		} else {
 			infoEl.textContent = info || "Active"
 		}
+	}
 
+	function showFloatingCta(title, info, onClose, extraActions = null) {
+		hideFloatingCta()
+		const root = getShadowRoot()
+		floatingCta = el("div", "dk-floating-cta-bar")
+		floatingCtaClose = onClose
+		const pill = el("div", "dk-cta-pill")
+		const dot = el("span", "dk-cta-dot")
+		const titleEl = el("span", "dk-cta-title")
+		titleEl.textContent = String(title).replace(/^Sidekick:\s*/, "")
+		const infoEl = el("span", "dk-cta-info")
+		appendCtaInfo(infoEl, info, onClose)
 		pill.append(dot, titleEl, infoEl)
 
+		const actionButtons = []
 		if (Array.isArray(extraActions)) {
 			for (const action of extraActions) {
-				const actionBtn = el("button", "dk-cta-action-btn")
-				actionBtn.type = "button"
-				actionBtn.textContent = action.label
-				actionBtn.title = action.title || ""
-				actionBtn.style.cssText = "background: rgba(59, 130, 246, 0.25) !important; color: #93c5fd !important; border: 1px solid rgba(59, 130, 246, 0.5) !important; border-radius: 9999px !important; padding: 4px 10px !important; font-size: 11px !important; font-weight: 600 !important; cursor: pointer !important; margin-left: 6px !important; transition: all 0.15s ease !important;"
+				const actionBtn = skButton(action.icon ?? null, action.label, action.title || action.label)
+				actionBtn.classList.add("dk-cta-action-btn")
 				actionBtn.addEventListener("click", (e) => {
 					e.preventDefault()
 					e.stopPropagation()
 					action.action?.()
 				})
+				actionButtons.push(actionBtn)
 				pill.appendChild(actionBtn)
 			}
 		}
 
 		let isMinimized = false
-		const minBtn = el("button", "dk-cta-min-btn")
-		minBtn.type = "button"
-		minBtn.textContent = "—"
-		minBtn.title = "Minimize floating bar (or click again to expand)"
-		minBtn.style.cssText = "background: rgba(255, 255, 255, 0.1) !important; color: #cbd5e1 !important; border: 1px solid rgba(255, 255, 255, 0.2) !important; border-radius: 9999px !important; padding: 4px 8px !important; font-size: 11px !important; font-weight: 700 !important; cursor: pointer !important; margin-left: 6px !important; transition: all 0.15s ease !important;"
+		const minBtn = skButton("minus", null, "Minimize bar", "ghost")
+		minBtn.classList.add("sk-btn-icon")
+		const closeBtn = skButton("close", "Close", "Stop and close this tool (Esc)", "danger")
+		closeBtn.classList.add("dk-cta-close-btn")
 		minBtn.addEventListener("click", (e) => {
 			e.preventDefault()
 			e.stopPropagation()
 			isMinimized = !isMinimized
-			if (isMinimized) {
-				infoEl.style.display = "none"
-				pill.querySelectorAll(".dk-cta-action-btn").forEach((b) => (b.style.display = "none"))
-				closeBtn.style.display = "none"
-				minBtn.textContent = "＋"
-				minBtn.title = "Expand floating bar"
-			} else {
-				infoEl.style.display = ""
-				pill.querySelectorAll(".dk-cta-action-btn").forEach((b) => (b.style.display = ""))
-				closeBtn.style.display = ""
-				minBtn.textContent = "—"
-				minBtn.title = "Minimize floating bar"
-			}
+			const display = isMinimized ? "none" : ""
+			infoEl.style.display = display
+			for (const b of actionButtons) b.style.display = display
+			closeBtn.style.display = display
+			setButtonContent(minBtn, isMinimized ? "plus" : "minus", null)
+			minBtn.title = isMinimized ? "Expand bar" : "Minimize bar"
 		})
-		pill.appendChild(minBtn)
-
-		const closeBtn = el("button", "dk-cta-close-btn")
-		closeBtn.type = "button"
-		closeBtn.textContent = "✕ Close Tool"
-		closeBtn.title = "Stop and close this tool (or press Esc)"
 		closeBtn.addEventListener("click", (e) => {
 			e.preventDefault()
 			e.stopPropagation()
 			if (typeof onClose === "function") onClose()
 			hideFloatingCta()
 		})
-		pill.appendChild(closeBtn)
+		pill.append(minBtn, closeBtn)
 
 		floatingCta.appendChild(pill)
-		getShadowRoot().appendChild(floatingCta)
+		root.appendChild(floatingCta)
 	}
 
 	function updateFloatingCta(title, info, onClose) {
 		if (!floatingCta) return
 		const titleEl = floatingCta.querySelector(".dk-cta-title")
 		const infoEl = floatingCta.querySelector(".dk-cta-info")
-		if (titleEl && title) titleEl.textContent = title
-		if (infoEl && info) {
-			if (typeof info === "string" && info.includes("Esc to cancel")) {
-				infoEl.textContent = ""
-				const parts = info.split("Esc to cancel")
-				if (parts[0]) infoEl.appendChild(document.createTextNode(parts[0]))
-				const escBadge = el("button", "dk-cta-esc-badge")
-				escBadge.type = "button"
-				escBadge.textContent = "Esc"
-				escBadge.title = "Click or press Esc to cancel"
-				escBadge.addEventListener("click", (e) => {
-					e.preventDefault()
-					e.stopPropagation()
-					if (typeof onClose === "function") onClose()
-					else if (typeof activeSnipCancel === "function") activeSnipCancel()
-					hideFloatingCta()
-				})
-				infoEl.appendChild(escBadge)
-				infoEl.appendChild(document.createTextNode(" to cancel" + (parts[1] || "")))
-			} else {
-				infoEl.textContent = info
-			}
-		}
+		if (titleEl && title) titleEl.textContent = String(title).replace(/^Sidekick:\s*/, "")
+		if (infoEl && info) appendCtaInfo(infoEl, info, onClose ?? floatingCtaClose)
 	}
 
 	function hideFloatingCta() {
 		if (floatingCta?.parentNode) floatingCta.parentNode.removeChild(floatingCta)
 		floatingCta = null
+		floatingCtaClose = null
 	}
 
-	let pulseBox = null
+	// Scroll an element into view and flash an outline that follows it while the page scrolls.
 	function highlightElement(payload) {
 		const selector = payload?.selector
 		if (!selector) return { ok: false, error: "No selector provided" }
+		let target
 		try {
-			const target = document.querySelector(selector)
-			if (!target) return { ok: false, error: `Element not found on page: ${selector}` }
-			target.scrollIntoView({ behavior: "smooth", block: "center" })
-
-			const root = getShadowRoot()
-			ensureStyles()
-			if (pulseBox?.parentNode) pulseBox.remove()
-			const rect = target.getBoundingClientRect()
-			pulseBox = el("div", "dk-pulse-box dk-root")
-			pulseBox.style.cssText = `
-				position: fixed !important;
-				top: ${Math.max(0, rect.top - 4)}px !important;
-				left: ${Math.max(0, rect.left - 4)}px !important;
-				width: ${rect.width + 8}px !important;
-				height: ${rect.height + 8}px !important;
-				border: 3px solid #ef4444 !important;
-				background: rgba(239, 68, 68, 0.15) !important;
-				border-radius: 4px !important;
-				box-shadow: 0 0 24px rgba(239, 68, 68, 0.6), 0 0 0 1px #ffffff !important;
-				z-index: 2147483646 !important;
-				pointer-events: none !important;
-				animation: dkPulse 1.2s infinite ease-in-out !important;
-			`
-			const label = el("div", "dk-pulse-label")
-			label.textContent = selector.length > 50 ? selector.slice(0, 47) + "…" : selector
-			label.style.cssText = `
-				position: absolute !important;
-				top: -26px !important;
-				left: 0 !important;
-				background: #ef4444 !important;
-				color: #ffffff !important;
-				font-size: 11px !important;
-				font-weight: 700 !important;
-				padding: 2px 8px !important;
-				border-radius: 4px !important;
-				white-space: nowrap !important;
-				font-family: monospace !important;
-			`
-			pulseBox.appendChild(label)
-			root.appendChild(pulseBox)
-			setTimeout(() => {
-				if (pulseBox?.parentNode) pulseBox.remove()
-				pulseBox = null
-			}, 6000)
-			return { ok: true }
+			target = queryDeep(selector)
 		} catch (e) {
-			return { ok: false, error: e.message }
+			return { ok: false, error: `Invalid selector: ${e.message}` }
 		}
+		if (!target) return { ok: false, error: `Element not found on page: ${selector}` }
+		runCleanup("highlight-element")
+		try {
+			target.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" })
+		} catch {
+			target.scrollIntoView()
+		}
+		const root = getShadowRoot()
+		const box = el("div", "dk-pulse-box")
+		const label = el("div", "dk-pulse-label")
+		label.textContent = selector.length > 70 ? `${selector.slice(0, 67)}...` : selector
+		box.appendChild(label)
+		root.appendChild(box)
+		let frame = 0
+		const follow = () => {
+			const rect = target.getBoundingClientRect()
+			box.style.top = `${Math.round(rect.top - 4)}px`
+			box.style.left = `${Math.round(rect.left - 4)}px`
+			box.style.width = `${Math.round(rect.width + 8)}px`
+			box.style.height = `${Math.round(rect.height + 8)}px`
+			box.style.display = rect.width || rect.height ? "block" : "none"
+			frame = requestAnimationFrame(follow)
+		}
+		follow()
+		const timer = setTimeout(() => runCleanup("highlight-element"), 3500)
+		registerCleanup("highlight-element", () => {
+			cancelAnimationFrame(frame)
+			clearTimeout(timer)
+			box.remove()
+		})
+		const rect = target.getBoundingClientRect()
+		return { ok: true, data: { found: true, visible: rect.width > 0 && rect.height > 0 } }
 	}
 
-	function cssPath(node) {
-		if (!(node instanceof Element)) return ""
-		if (node.id) return `#${CSS.escape(node.id)}`
+	function cssPathLocal(node) {
+		if (node.id && /^[A-Za-z][\w-]*$/.test(node.id)) {
+			try {
+				if ((node.getRootNode?.() ?? document).querySelectorAll(`#${CSS.escape(node.id)}`).length === 1) return `#${CSS.escape(node.id)}`
+			} catch {}
+		}
 		const parts = []
 		let current = node
-		while (current && current.nodeType === 1 && parts.length < 5) {
+		while (current && current.nodeType === 1 && parts.length < 6) {
+			if (parts.length && current.id && /^[A-Za-z][\w-]*$/.test(current.id)) {
+				parts.unshift(`#${CSS.escape(current.id)}`)
+				break
+			}
 			let part = current.tagName.toLowerCase()
-			if (current.classList.length) part += `.${[...current.classList].slice(0, 2).map((c) => CSS.escape(c)).join(".")}`
+			const classes = [...current.classList].filter((c) => !/^(dk-|sk-)/.test(c) && !/[:[\]/]/.test(c)).slice(0, 2)
+			if (classes.length) part += `.${classes.map((c) => CSS.escape(c)).join(".")}`
 			const parent = current.parentElement
 			if (parent) {
-				const twins = [...parent.children].filter((child) => child.tagName === current.tagName)
-				if (twins.length > 1) part += `:nth-of-type(${twins.indexOf(current) + 1})`
+				let index = 0
+				let twins = 0
+				for (const child of parent.children) {
+					if (child.tagName === current.tagName) {
+						twins++
+						if (child === current) index = twins
+					}
+				}
+				if (twins > 1) part += `:nth-of-type(${index})`
 			}
 			parts.unshift(part)
-			current = current.parentElement
+			current = parent
 		}
 		return parts.join(" > ")
+	}
+
+	// Selector for a node; nodes inside open shadow roots get "host >>> inner" segments.
+	function cssPath(node) {
+		if (!(node instanceof Element)) return ""
+		const segments = []
+		let current = node
+		for (let depth = 0; current && depth < 5; depth++) {
+			segments.unshift(cssPathLocal(current))
+			const root = current.getRootNode?.()
+			if (root && root !== document && root.host) current = root.host
+			else break
+		}
+		return segments.join(" >>> ")
 	}
 
 	function toHex(color) {
@@ -848,38 +874,33 @@
 	}
 
 	function getInlineListeners(node) {
-		const found = []
-		const attrs = [
-			"onclick", "onmouseover", "onmouseout", "onmousedown", "onmouseup",
-			"onkeydown", "onkeyup", "onkeypress", "onfocus", "onblur",
-			"onchange", "oninput", "onsubmit", "onscroll", "onresize",
-			"ontouchstart", "ontouchend", "onwheel", "ondrag", "ondrop",
-		]
-		for (const attr of attrs) {
-			if (node.hasAttribute(attr) || typeof node[attr] === "function") {
-				found.push(attr.replace("on", ""))
-			}
+		const found = new Set()
+		for (const attr of node.attributes) {
+			if (/^on[a-z]+$/.test(attr.name)) found.add(attr.name.slice(2))
 		}
-		return found
+		// Property handlers and React props live in the page world; addEventListener ones stay invisible.
+		for (const handler of probeMain({ node: true }, node)?.node?.handlers ?? []) found.add(handler)
+		return [...found]
 	}
 
 	function getFrameworkBindings(node) {
 		const bindings = []
-
-		for (const key of Object.keys(node)) {
-			if (key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$")) {
-				bindings.push("React component")
-				break
+		const probed = probeMain({ node: true }, node)?.node
+		for (const name of probed?.frameworks ?? []) bindings.push(`${name} component`)
+		if (!bindings.length) {
+			for (const key of Object.keys(node)) {
+				if (key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$")) {
+					bindings.push("React component")
+					break
+				}
 			}
 		}
-
-		if (node.__vue__ || node.__vue_app__ || node._vnode) bindings.push("Vue instance")
-
 		const ngAttrs = [...node.attributes].filter((a) => a.name.startsWith("_ng") || a.name.startsWith("ng-"))
-		if (ngAttrs.length) bindings.push("Angular binding")
-
-		const svelteClasses = [...node.classList].filter((c) => /^svelte-/.test(c))
-		if (svelteClasses.length) bindings.push("Svelte component")
+		if (ngAttrs.length && !bindings.includes("Angular component")) bindings.push("Angular binding")
+		if ([...node.classList].some((c) => /^svelte-/.test(c)) && !bindings.includes("Svelte component")) bindings.push("Svelte component")
+		if (node.hasAttribute("data-v-app") || [...node.attributes].some((a) => a.name.startsWith("data-v-"))) {
+			if (!bindings.includes("Vue component")) bindings.push("Vue scoped styles")
+		}
 		return bindings
 	}
 
@@ -928,6 +949,64 @@
 
 	let inspectedNode = null
 	let componentBoundary = null
+	let lastHoverTarget = null
+
+	function placeHighlight(rect) {
+		if (!highlight || !highlight.isConnected) {
+			highlight = el("div", "dk-highlight")
+			getShadowRoot().appendChild(highlight)
+		}
+		highlight.style.cssText = `display: block; top: ${Math.round(rect.top)}px; left: ${Math.round(rect.left)}px; width: ${Math.max(2, Math.round(rect.width))}px; height: ${Math.max(2, Math.round(rect.height))}px;`
+	}
+
+	const renderInspectHover = rafThrottle((node, clientX, clientY) => {
+		if (!state.inspect && !deepInspectPending) return
+		if (!node?.isConnected) return
+		try {
+			// Reads first, then writes, once per animation frame at most.
+			const rect = node.getBoundingClientRect()
+			const sameTarget = node === lastHoverTarget
+			let info = null
+			if (!sameTarget) {
+				const style = getComputedStyle(node)
+				const bg = effectiveBackground(node)
+				const contrastRatio = contrast(style.color, bg)
+				const contrastNum = contrastRatio ?? 0
+				info = {
+					tag: node.tagName.toLowerCase(),
+					id: node.id,
+					classes: [...node.classList].slice(0, 3),
+					width: Math.round(rect.width),
+					height: Math.round(rect.height),
+					font: (style.fontFamily || "sans-serif").split(",")[0].replace(/['"]/g, ""),
+					fontSize: style.fontSize,
+					fontWeight: style.fontWeight,
+					color: toHex(style.color),
+					colorRaw: style.color,
+					bg: toHex(bg),
+					bgRaw: bg,
+					contrast: contrastRatio,
+					aaPass: contrastNum >= 4.5,
+					aaaPass: contrastNum >= 7,
+					display: style.display,
+					position: style.position,
+					margin: { top: style.marginTop, right: style.marginRight, bottom: style.marginBottom, left: style.marginLeft },
+					padding: { top: style.paddingTop, right: style.paddingRight, bottom: style.paddingBottom, left: style.paddingLeft },
+					border: { top: style.borderTopWidth, right: style.borderRightWidth, bottom: style.borderBottomWidth, left: style.borderLeftWidth },
+					borderColor: toHex(style.borderTopColor),
+					borderStyle: style.borderTopStyle,
+					zIndex: style.zIndex,
+				}
+			}
+			placeHighlight(rect)
+			if (info) {
+				lastHoverTarget = node
+				showVisualHud(node, info, { clientX, clientY })
+			} else if (hud) {
+				positionHud({ clientX, clientY }, hud)
+			}
+		} catch {}
+	})
 
 	function onMove(event) {
 		if (!state.inspect && !deepInspectPending) return
@@ -937,83 +1016,15 @@
 		}
 		const node = event.target
 		if (!(node instanceof Element)) return
-
-		try {
-			ensureStyles()
-			const rect = node.getBoundingClientRect()
-			if (!highlight) {
-				highlight = el("div", "dk-highlight")
-				getShadowRoot().appendChild(highlight)
-			}
-
-			const style = getComputedStyle(node)
-			const mt = parseFloat(style.marginTop) || 0
-			const mr = parseFloat(style.marginRight) || 0
-			const mb = parseFloat(style.marginBottom) || 0
-			const ml = parseFloat(style.marginLeft) || 0
-			highlight.style.cssText = `
-				position: fixed !important;
-				z-index: 2147483645 !important;
-				pointer-events: none !important;
-				border: 2px solid #3b82f6 !important;
-				background: rgba(59, 130, 246, 0.08) !important;
-				border-radius: 3px !important;
-				top: ${Math.round(rect.top)}px !important;
-				left: ${Math.round(rect.left)}px !important;
-				width: ${Math.max(2, Math.round(rect.width))}px !important;
-				height: ${Math.max(2, Math.round(rect.height))}px !important;
-				display: block !important;
-				box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7), 0 0 16px rgba(59, 130, 246, 0.35) !important;
-			`
-
-			const bg = effectiveBackground(node)
-			const fontFam = (style.fontFamily || "sans-serif").split(",")[0].replace(/['"]/g, "")
-			const contrastRatio = contrast(style.color, bg)
-			const contrastNum = contrastRatio ?? 0
-			const aaPass = contrastNum >= 4.5
-			const aaaPass = contrastNum >= 7
-			const pt = style.paddingTop, pr = style.paddingRight, pb = style.paddingBottom, pl = style.paddingLeft
-
-			showVisualHud(node, {
-				tag: node.tagName.toLowerCase(),
-				id: node.id,
-				classes: [...node.classList].slice(0, 3),
-				width: Math.round(rect.width),
-				height: Math.round(rect.height),
-				font: fontFam,
-				fontSize: style.fontSize,
-				fontWeight: style.fontWeight,
-				color: toHex(style.color),
-				colorRaw: style.color,
-				bg: toHex(bg),
-				bgRaw: bg,
-				contrast: contrastRatio,
-				aaPass,
-				aaaPass,
-				display: style.display,
-				position: style.position,
-				margin: { top: style.marginTop, right: style.marginRight, bottom: style.marginBottom, left: style.marginLeft },
-				padding: { top: pt, right: pr, bottom: pb, left: pl },
-				border: {
-					top: style.borderTopWidth, right: style.borderRightWidth,
-					bottom: style.borderBottomWidth, left: style.borderLeftWidth,
-				},
-				borderColor: toHex(style.borderTopColor),
-				borderStyle: style.borderTopStyle,
-				zIndex: style.zIndex,
-			}, event)
-		} catch {
-
-		}
+		renderInspectHover(node, event.clientX, event.clientY)
 	}
 
 	function showVisualHud(node, info, event) {
-		ensureStyles()
-		if (!hud || !hud.parentNode) {
+		if (!hud || !hud.isConnected) {
 			hud = el("div", "dk-hud")
 			getShadowRoot().appendChild(hud)
 		}
-		hud.innerHTML = ""
+		hud.textContent = ""
 		hud.style.maxWidth = "400px"
 
 		const tagRow = el("div")
@@ -1022,28 +1033,28 @@
 		const isSemanticTag = semanticTags.has(info.tag)
 		const tagPill = el("span")
 		tagPill.textContent = `<${info.tag}>`
-		tagPill.style.cssText = `display: inline-block !important; padding: 2px 8px !important; border-radius: 4px !important; font-size: 11px !important; font-weight: 700 !important; font-family: ui-monospace, monospace !important; background: ${isSemanticTag ? "rgba(16, 185, 129, 0.2)" : "rgba(148, 163, 184, 0.2)"} !important; color: ${isSemanticTag ? "#34d399" : "#94a3b8"} !important; border: 1px solid ${isSemanticTag ? "rgba(16, 185, 129, 0.3)" : "rgba(148, 163, 184, 0.2)"} !important;`
+		tagPill.style.cssText = `display: inline-block !important; padding: 2px 8px !important; border-radius: 6px !important; font-size: 11px !important; font-weight: 700 !important; font-family: ui-monospace, monospace !important; background: ${isSemanticTag ? "rgba(20, 184, 166, 0.2)" : "rgba(179, 168, 148, 0.2)"} !important; color: ${isSemanticTag ? "#2dd4bf" : "#b3a894"} !important; border: 1px solid ${isSemanticTag ? "rgba(20, 184, 166, 0.3)" : "rgba(179, 168, 148, 0.2)"} !important;`
 		tagRow.appendChild(tagPill)
 		if (info.id) {
 			const idPill = el("span")
 			idPill.textContent = `#${info.id}`
-			idPill.style.cssText = "display: inline-block !important; padding: 2px 6px !important; border-radius: 4px !important; font-size: 10px !important; font-weight: 600 !important; font-family: ui-monospace, monospace !important; background: rgba(139, 92, 246, 0.2) !important; color: #a78bfa !important;"
+			idPill.style.cssText = "display: inline-block !important; padding: 2px 6px !important; border-radius: 6px !important; font-size: 10px !important; font-weight: 600 !important; font-family: ui-monospace, monospace !important; background: rgba(20, 184, 166, 0.2) !important; color: #2dd4bf !important;"
 			tagRow.appendChild(idPill)
 		}
 		if (info.classes.length) {
 			const clsPill = el("span")
 			clsPill.textContent = `.${info.classes.join(".")}`
-			clsPill.style.cssText = "display: inline-block !important; padding: 2px 6px !important; border-radius: 4px !important; font-size: 10px !important; font-family: ui-monospace, monospace !important; color: #64748b !important; max-width: 160px !important; overflow: hidden !important; text-overflow: ellipsis !important; white-space: nowrap !important;"
+			clsPill.style.cssText = "display: inline-block !important; padding: 2px 6px !important; border-radius: 6px !important; font-size: 10px !important; font-family: ui-monospace, monospace !important; color: #857a68 !important; max-width: 160px !important; overflow: hidden !important; text-overflow: ellipsis !important; white-space: nowrap !important;"
 			tagRow.appendChild(clsPill)
 		}
 		const layoutPill = el("span")
 		layoutPill.textContent = info.display
-		layoutPill.style.cssText = "display: inline-block !important; padding: 2px 6px !important; border-radius: 4px !important; font-size: 10px !important; font-weight: 600 !important; background: rgba(59, 130, 246, 0.15) !important; color: #60a5fa !important;"
+		layoutPill.style.cssText = "display: inline-block !important; padding: 2px 6px !important; border-radius: 6px !important; font-size: 10px !important; font-weight: 600 !important; background: rgba(255, 90, 31, 0.15) !important; color: #ff8a5c !important;"
 		tagRow.appendChild(layoutPill)
 		if (info.position !== "static") {
 			const posPill = el("span")
 			posPill.textContent = info.position
-			posPill.style.cssText = "display: inline-block !important; padding: 2px 6px !important; border-radius: 4px !important; font-size: 10px !important; background: rgba(245, 158, 11, 0.15) !important; color: #fbbf24 !important;"
+			posPill.style.cssText = "display: inline-block !important; padding: 2px 6px !important; border-radius: 6px !important; font-size: 10px !important; background: rgba(245, 177, 61, 0.15) !important; color: #f5b13d !important;"
 			tagRow.appendChild(posPill)
 		}
 		hud.appendChild(tagRow)
@@ -1057,14 +1068,14 @@
 		const metricsRow = el("div")
 		metricsRow.style.cssText = "display: flex !important; flex-wrap: wrap !important; gap: 6px !important; margin-top: 6px !important;"
 
-		addMetricChip(metricsRow, "📐", `${info.width} × ${info.height}`)
+		addMetricChip(metricsRow, "ruler", `${info.width} × ${info.height}`)
 
-		addMetricChip(metricsRow, "🔤", `${info.font} ${info.fontSize} w${info.fontWeight}`)
+		addMetricChip(metricsRow, "type", `${info.font} ${info.fontSize} w${info.fontWeight}`)
 
 		const colorChip = el("div")
-		colorChip.style.cssText = "display: flex !important; align-items: center !important; gap: 4px !important; padding: 2px 6px !important; border-radius: 4px !important; background: rgba(255,255,255,0.06) !important; font-size: 10px !important; color: #94a3b8 !important;"
+		colorChip.style.cssText = "display: flex !important; align-items: center !important; gap: 4px !important; padding: 2px 6px !important; border-radius: 6px !important; background: rgba(243,236,224,0.06) !important; font-size: 10px !important; color: #b3a894 !important;"
 		const colorSwatch = el("span")
-		colorSwatch.style.cssText = `width: 12px !important; height: 12px !important; border-radius: 3px !important; background: ${info.color} !important; border: 1px solid rgba(255,255,255,0.2) !important; flex-shrink: 0 !important;`
+		colorSwatch.style.cssText = `width: 12px !important; height: 12px !important; border-radius: 3px !important; background: ${info.color} !important; border: 1px solid rgba(243,236,224,0.2) !important; flex-shrink: 0 !important;`
 		const colorText = el("span")
 		colorText.textContent = info.color
 		colorText.style.cssText = "font-family: ui-monospace, monospace !important; font-size: 10px !important;"
@@ -1072,9 +1083,9 @@
 		metricsRow.appendChild(colorChip)
 
 		const bgChip = el("div")
-		bgChip.style.cssText = "display: flex !important; align-items: center !important; gap: 4px !important; padding: 2px 6px !important; border-radius: 4px !important; background: rgba(255,255,255,0.06) !important; font-size: 10px !important; color: #94a3b8 !important;"
+		bgChip.style.cssText = "display: flex !important; align-items: center !important; gap: 4px !important; padding: 2px 6px !important; border-radius: 6px !important; background: rgba(243,236,224,0.06) !important; font-size: 10px !important; color: #b3a894 !important;"
 		const bgSwatch = el("span")
-		bgSwatch.style.cssText = `width: 12px !important; height: 12px !important; border-radius: 3px !important; background: ${info.bg} !important; border: 1px solid rgba(255,255,255,0.2) !important; flex-shrink: 0 !important;`
+		bgSwatch.style.cssText = `width: 12px !important; height: 12px !important; border-radius: 3px !important; background: ${info.bg} !important; border: 1px solid rgba(243,236,224,0.2) !important; flex-shrink: 0 !important;`
 		const bgText = el("span")
 		bgText.textContent = `bg:${info.bg}`
 		bgText.style.cssText = "font-family: ui-monospace, monospace !important; font-size: 10px !important;"
@@ -1084,9 +1095,9 @@
 		if (info.contrast !== null && info.contrast !== undefined) {
 			const contrastChip = el("div")
 			const passLevel = info.aaaPass ? "AAA" : info.aaPass ? "AA" : "Fail"
-			const passColor = info.aaaPass ? "#34d399" : info.aaPass ? "#fbbf24" : "#f87171"
-			const passBg = info.aaaPass ? "rgba(16,185,129,0.15)" : info.aaPass ? "rgba(251,191,36,0.15)" : "rgba(248,113,113,0.15)"
-			contrastChip.style.cssText = `display: flex !important; align-items: center !important; gap: 3px !important; padding: 2px 6px !important; border-radius: 4px !important; background: ${passBg} !important; font-size: 10px !important; font-weight: 600 !important; color: ${passColor} !important;`
+			const passColor = info.aaaPass ? "#2dd4bf" : info.aaPass ? "#f5b13d" : "#ff6b6b"
+			const passBg = info.aaaPass ? "rgba(20, 184, 166,0.15)" : info.aaPass ? "rgba(245, 177, 61,0.15)" : "rgba(255, 107, 107,0.15)"
+			contrastChip.style.cssText = `display: flex !important; align-items: center !important; gap: 3px !important; padding: 2px 6px !important; border-radius: 6px !important; background: ${passBg} !important; font-size: 10px !important; font-weight: 600 !important; color: ${passColor} !important;`
 			contrastChip.textContent = `${info.contrast}:1 ${passLevel}`
 			metricsRow.appendChild(contrastChip)
 		}
@@ -1096,59 +1107,62 @@
 		positionHud(event, hud)
 	}
 
-	function addMetricChip(parent, icon, text) {
+	function addMetricChip(parent, iconName, text) {
 		const chip = el("div")
-		chip.style.cssText = "display: flex !important; align-items: center !important; gap: 3px !important; padding: 2px 6px !important; border-radius: 4px !important; background: rgba(255,255,255,0.06) !important; font-size: 10px !important; color: #94a3b8 !important; white-space: nowrap !important;"
-		chip.textContent = `${icon} ${text}`
+		chip.style.cssText = "display: flex !important; align-items: center !important; gap: 4px !important; padding: 2px 6px !important; border-radius: 6px !important; background: rgba(243,236,224,0.06) !important; font-size: 10px !important; color: #b3a894 !important; white-space: nowrap !important; font-family: ui-monospace, monospace !important;"
+		chip.appendChild(icon(iconName, 11))
+		const label = el("span")
+		label.textContent = text
+		chip.appendChild(label)
 		parent.appendChild(chip)
 	}
 
 	function buildBoxModelDiagram(info) {
 		const wrap = el("div")
-		wrap.style.cssText = "position: relative !important; width: 240px !important; height: 150px !important; font-family: ui-monospace, monospace !important; font-size: 9px !important; color: #e2e8f0 !important;"
+		wrap.style.cssText = "position: relative !important; width: 240px !important; height: 150px !important; font-family: ui-monospace, monospace !important; font-size: 9px !important; color: #f3ece0 !important;"
 
 		const marginBox = el("div")
-		marginBox.style.cssText = "position: absolute !important; inset: 0 !important; background: rgba(249, 115, 22, 0.15) !important; border: 1px dashed rgba(249, 115, 22, 0.5) !important; border-radius: 4px !important; display: flex !important; flex-direction: column !important; align-items: center !important; justify-content: center !important;"
+		marginBox.style.cssText = "position: absolute !important; inset: 0 !important; background: rgba(255, 138, 92, 0.15) !important; border: 1px dashed rgba(255, 138, 92, 0.5) !important; border-radius: 6px !important; display: flex !important; flex-direction: column !important; align-items: center !important; justify-content: center !important;"
 
-		addBoxLabel(marginBox, "top", info.margin.top, "#fb923c")
-		addBoxLabel(marginBox, "right", info.margin.right, "#fb923c")
-		addBoxLabel(marginBox, "bottom", info.margin.bottom, "#fb923c")
-		addBoxLabel(marginBox, "left", info.margin.left, "#fb923c")
+		addBoxLabel(marginBox, "top", info.margin.top, "#ff8a5c")
+		addBoxLabel(marginBox, "right", info.margin.right, "#ff8a5c")
+		addBoxLabel(marginBox, "bottom", info.margin.bottom, "#ff8a5c")
+		addBoxLabel(marginBox, "left", info.margin.left, "#ff8a5c")
 
 		const borderBox = el("div")
-		borderBox.style.cssText = "position: absolute !important; inset: 18px !important; background: rgba(250, 204, 21, 0.12) !important; border: 1px solid rgba(250, 204, 21, 0.5) !important; border-radius: 3px !important;"
-		addBoxLabel(borderBox, "top", info.border.top, "#facc15")
-		addBoxLabel(borderBox, "right", info.border.right, "#facc15")
-		addBoxLabel(borderBox, "bottom", info.border.bottom, "#facc15")
-		addBoxLabel(borderBox, "left", info.border.left, "#facc15")
+		borderBox.style.cssText = "position: absolute !important; inset: 18px !important; background: rgba(245, 177, 61, 0.12) !important; border: 1px solid rgba(245, 177, 61, 0.5) !important; border-radius: 3px !important;"
+		addBoxLabel(borderBox, "top", info.border.top, "#f5b13d")
+		addBoxLabel(borderBox, "right", info.border.right, "#f5b13d")
+		addBoxLabel(borderBox, "bottom", info.border.bottom, "#f5b13d")
+		addBoxLabel(borderBox, "left", info.border.left, "#f5b13d")
 
 		const paddingBox = el("div")
-		paddingBox.style.cssText = "position: absolute !important; inset: 32px !important; background: rgba(34, 197, 94, 0.12) !important; border: 1px solid rgba(34, 197, 94, 0.4) !important; border-radius: 2px !important;"
-		addBoxLabel(paddingBox, "top", info.padding.top, "#4ade80")
-		addBoxLabel(paddingBox, "right", info.padding.right, "#4ade80")
-		addBoxLabel(paddingBox, "bottom", info.padding.bottom, "#4ade80")
-		addBoxLabel(paddingBox, "left", info.padding.left, "#4ade80")
+		paddingBox.style.cssText = "position: absolute !important; inset: 32px !important; background: rgba(20, 184, 166, 0.12) !important; border: 1px solid rgba(20, 184, 166, 0.4) !important; border-radius: 2px !important;"
+		addBoxLabel(paddingBox, "top", info.padding.top, "#2dd4bf")
+		addBoxLabel(paddingBox, "right", info.padding.right, "#2dd4bf")
+		addBoxLabel(paddingBox, "bottom", info.padding.bottom, "#2dd4bf")
+		addBoxLabel(paddingBox, "left", info.padding.left, "#2dd4bf")
 
 		const contentBox = el("div")
-		contentBox.style.cssText = "position: absolute !important; inset: 46px !important; background: rgba(59, 130, 246, 0.2) !important; border: 1px solid rgba(59, 130, 246, 0.5) !important; border-radius: 2px !important; display: flex !important; align-items: center !important; justify-content: center !important;"
+		contentBox.style.cssText = "position: absolute !important; inset: 46px !important; background: rgba(255, 90, 31, 0.2) !important; border: 1px solid rgba(255, 90, 31, 0.5) !important; border-radius: 2px !important; display: flex !important; align-items: center !important; justify-content: center !important;"
 		const contentLabel = el("span")
 		contentLabel.textContent = `${info.width} × ${info.height}`
-		contentLabel.style.cssText = "font-size: 10px !important; color: #93c5fd !important; font-weight: 600 !important;"
+		contentLabel.style.cssText = "font-size: 10px !important; color: #ffb08a !important; font-weight: 600 !important;"
 		contentBox.appendChild(contentLabel)
 
 		const marLabel = el("span")
 		marLabel.textContent = "margin"
-		marLabel.style.cssText = "position: absolute !important; top: 2px !important; left: 4px !important; font-size: 8px !important; color: #fb923c !important; text-transform: uppercase !important; letter-spacing: 0.03em !important;"
+		marLabel.style.cssText = "position: absolute !important; top: 2px !important; left: 4px !important; font-size: 8px !important; color: #ff8a5c !important; text-transform: uppercase !important; letter-spacing: 0.03em !important;"
 		marginBox.appendChild(marLabel)
 
 		const borLabel = el("span")
 		borLabel.textContent = "border"
-		borLabel.style.cssText = "position: absolute !important; top: 2px !important; left: 4px !important; font-size: 8px !important; color: #facc15 !important; text-transform: uppercase !important; letter-spacing: 0.03em !important;"
+		borLabel.style.cssText = "position: absolute !important; top: 2px !important; left: 4px !important; font-size: 8px !important; color: #f5b13d !important; text-transform: uppercase !important; letter-spacing: 0.03em !important;"
 		borderBox.appendChild(borLabel)
 
 		const padLabel = el("span")
 		padLabel.textContent = "padding"
-		padLabel.style.cssText = "position: absolute !important; top: 1px !important; left: 3px !important; font-size: 8px !important; color: #4ade80 !important; text-transform: uppercase !important; letter-spacing: 0.03em !important;"
+		padLabel.style.cssText = "position: absolute !important; top: 1px !important; left: 3px !important; font-size: 8px !important; color: #2dd4bf !important; text-transform: uppercase !important; letter-spacing: 0.03em !important;"
 		paddingBox.appendChild(padLabel)
 
 		marginBox.appendChild(borderBox)
@@ -1193,7 +1207,7 @@
 		if (isDevKitEvent(event)) return
 		const node = event.target
 		if (!(node instanceof Element)) return
-		if (node === shadowHost || node.id === "devkit-shadow-host" || node.closest?.(".dk-root, #devkit-shadow-host")) return
+		if (isDevKitNode(node)) return
 		event.preventDefault()
 		event.stopPropagation()
 
@@ -1240,7 +1254,8 @@
 		}
 		walk(clone)
 
-		return formatHtml(clone.outerHTML)
+		const html = formatHtml(clone.outerHTML.slice(0, 200000))
+		return html.length > 120000 ? `${html.slice(0, 120000)}\n<!-- truncated by Sidekick -->` : html
 	}
 
 	function formatHtml(html) {
@@ -1263,9 +1278,11 @@
 		if (!node) return ""
 		const rules = {}
 		const processed = new Set()
+		let visited = 0
 
+		// Cap the subtree walk: a click on <body> would otherwise read styles of thousands of nodes.
 		const processNode = (el, depth) => {
-			if (!(el instanceof Element) || depth > 6) return
+			if (!(el instanceof Element) || depth > 6 || visited++ > 150) return
 			const tag = el.tagName.toLowerCase()
 			const cls = el.className ? `.${[...el.classList].slice(0, 2).join(".")}` : ""
 			const selector = depth === 0 ? `.component` : `${cls || tag}`
@@ -1469,23 +1486,24 @@
 		getShadowRoot().appendChild(inspectorOverlay)
 
 		inspectorDrawer = el("div", "dk-drawer-panel dk-root")
-		inspectorDrawer.style.cssText += "font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important; color: #e2e8f0 !important;"
+		inspectorDrawer.style.cssText += "font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif !important; color: #f3ece0 !important;"
 		getShadowRoot().appendChild(inspectorDrawer)
 
 		const header = el("div")
-		header.style.cssText = "display: flex !important; justify-content: space-between !important; align-items: center !important; padding: 16px 20px !important; border-bottom: 1px solid rgba(255,255,255,0.08) !important; flex-shrink: 0 !important;"
+		header.style.cssText = "display: flex !important; justify-content: space-between !important; align-items: center !important; padding: 16px 20px !important; border-bottom: 1px solid rgba(243,236,224,0.08) !important; flex-shrink: 0 !important;"
 		const titleArea = el("div")
 		const title = el("h3")
 		title.textContent = "Element Inspector"
-		title.style.cssText = "margin: 0 !important; font-size: 15px !important; font-weight: 700 !important; color: #f8fafc !important;"
+		title.style.cssText = "margin: 0 !important; font-size: 15px !important; font-weight: 700 !important; color: #f3ece0 !important;"
 		const subtitle = el("div")
 		subtitle.textContent = `<${node.tagName.toLowerCase()}>${node.id ? "#" + node.id : ""} — ${selector.slice(0, 50)}`
-		subtitle.style.cssText = "margin-top: 3px !important; font-size: 11px !important; color: #64748b !important; font-family: ui-monospace, monospace !important;"
+		subtitle.style.cssText = "margin-top: 3px !important; font-size: 11px !important; color: #857a68 !important; font-family: ui-monospace, monospace !important;"
 		titleArea.append(title, subtitle)
 		const closeBtn = el("button")
-		closeBtn.textContent = "✕"
+		closeBtn.appendChild(icon("close", 14))
+		closeBtn.title = "Close inspector"
 		closeBtn.type = "button"
-		closeBtn.style.cssText = "background: rgba(255,255,255,0.06) !important; color: #94a3b8 !important; border: 1px solid rgba(255,255,255,0.1) !important; border-radius: 6px !important; width: 32px !important; height: 32px !important; font-size: 14px !important; cursor: pointer !important; display: flex !important; align-items: center !important; justify-content: center !important;"
+		closeBtn.style.cssText = "background: rgba(243,236,224,0.06) !important; color: #b3a894 !important; border: 1px solid rgba(243,236,224,0.1) !important; border-radius: 6px !important; width: 32px !important; height: 32px !important; font-size: 14px !important; cursor: pointer !important; display: flex !important; align-items: center !important; justify-content: center !important;"
 		closeBtn.addEventListener("click", (e) => {
 			e.preventDefault()
 			e.stopPropagation()
@@ -1495,7 +1513,7 @@
 		inspectorDrawer.appendChild(header)
 
 		const tabBar = el("div")
-		tabBar.style.cssText = "display: flex !important; gap: 0 !important; padding: 0 20px !important; border-bottom: 1px solid rgba(255,255,255,0.08) !important; flex-shrink: 0 !important;"
+		tabBar.style.cssText = "display: flex !important; gap: 0 !important; padding: 0 20px !important; border-bottom: 1px solid rgba(243,236,224,0.08) !important; flex-shrink: 0 !important;"
 		const tabs = ["HTML", "CSS", "Copy", "Box Model", "Data"]
 		const tabPanels = []
 		const tabBtns = []
@@ -1503,7 +1521,7 @@
 			const btn = el("button")
 			btn.type = "button"
 			btn.textContent = tabName
-			btn.style.cssText = "padding: 10px 14px !important; font-size: 12px !important; font-weight: 600 !important; background: none !important; border: none !important; border-bottom: 2px solid transparent !important; color: #64748b !important; cursor: pointer !important; transition: all 0.15s !important;"
+			btn.style.cssText = "padding: 10px 14px !important; font-size: 12px !important; font-weight: 600 !important; background: none !important; border: none !important; border-bottom: 2px solid transparent !important; color: #857a68 !important; cursor: pointer !important; transition: all 0.15s !important;"
 			tabBtns.push(btn)
 			tabBar.appendChild(btn)
 		}
@@ -1533,8 +1551,8 @@
 
 		function switchTab(idx) {
 			tabBtns.forEach((btn, i) => {
-				btn.style.borderBottomColor = i === idx ? "#3b82f6" : "transparent"
-				btn.style.color = i === idx ? "#f8fafc" : "#64748b"
+				btn.style.borderBottomColor = i === idx ? "#ff5a1f" : "transparent"
+				btn.style.color = i === idx ? "#f3ece0" : "#857a68"
 			})
 			tabPanels.forEach((panel, i) => {
 				panel.style.display = i === idx ? "block" : "none"
@@ -1561,23 +1579,23 @@
 		toolbar.style.cssText = "display: flex !important; justify-content: space-between !important; align-items: center !important; margin-bottom: 10px !important;"
 		const langLabel = el("span")
 		langLabel.textContent = lang.toUpperCase()
-		langLabel.style.cssText = "font-size: 11px !important; font-weight: 700 !important; color: #60a5fa !important; text-transform: uppercase !important; letter-spacing: 0.05em !important;"
+		langLabel.style.cssText = "font-size: 11px !important; font-weight: 700 !important; color: #ff8a5c !important; text-transform: uppercase !important; letter-spacing: 0.05em !important;"
 		const copyBtn = el("button")
 		copyBtn.type = "button"
-		copyBtn.textContent = "📋 Copy"
-		copyBtn.style.cssText = "background: rgba(59, 130, 246, 0.15) !important; color: #93c5fd !important; border: 1px solid rgba(59, 130, 246, 0.3) !important; border-radius: 6px !important; padding: 5px 12px !important; font-size: 11px !important; cursor: pointer !important; font-weight: 600 !important;"
+		setButtonContent(copyBtn, "copy", "Copy")
+		copyBtn.style.cssText = "background: rgba(255, 90, 31, 0.15) !important; color: #ffb08a !important; border: 1px solid rgba(255, 90, 31, 0.3) !important; border-radius: 6px !important; padding: 5px 12px !important; font-size: 11px !important; cursor: pointer !important; font-weight: 600 !important;"
 		copyBtn.addEventListener("click", (e) => {
 			e.preventDefault()
 			e.stopPropagation()
 			copy(code)
-			copyBtn.textContent = "✓ Copied!"
-			setTimeout(() => { copyBtn.textContent = "📋 Copy" }, 1500)
+			setButtonContent(copyBtn, "check", "Copied")
+			setTimeout(() => setButtonContent(copyBtn, "copy", "Copy"), 1500)
 		})
 		toolbar.append(langLabel, copyBtn)
 		panel.appendChild(toolbar)
 
 		const pre = el("pre")
-		pre.style.cssText = "background: rgba(0,0,0,0.3) !important; border: 1px solid rgba(255,255,255,0.06) !important; border-radius: 8px !important; padding: 14px 16px !important; font-size: 12px !important; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important; line-height: 1.5 !important; overflow-x: auto !important; white-space: pre-wrap !important; word-break: break-word !important; color: #e2e8f0 !important; max-height: 500px !important;"
+		pre.style.cssText = "background: rgba(0,0,0,0.3) !important; border: 1px solid rgba(243,236,224,0.06) !important; border-radius: 8px !important; padding: 14px 16px !important; font-size: 12px !important; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important; line-height: 1.5 !important; overflow-x: auto !important; white-space: pre-wrap !important; word-break: break-word !important; color: #f3ece0 !important; max-height: 500px !important;"
 		pre.textContent = code
 		panel.appendChild(pre)
 		return panel
@@ -1587,67 +1605,68 @@
 		const panel = el("div")
 		const desc = el("p")
 		desc.textContent = "One-click copy in multiple formats. Click any button to copy to clipboard."
-		desc.style.cssText = "font-size: 12px !important; color: #64748b !important; margin: 0 0 14px 0 !important;"
+		desc.style.cssText = "font-size: 12px !important; color: #857a68 !important; margin: 0 0 14px 0 !important;"
 		panel.appendChild(desc)
 
 		const htmlCss = `<!-- Component extracted by Sidekick -->\n<style>\n${cleanCss}\n</style>\n\n${cleanHtml}`
-		addCopyButton(panel, "📄 HTML + CSS (self-contained)", htmlCss, "Complete snippet ready to paste into a new HTML file")
+		addCopyButton(panel, "file", "HTML + CSS (self-contained)", htmlCss, "Complete snippet ready to paste into a new HTML file")
 
-		const styles = extractCleanCss(node)
-		const twClasses = cssToTailwindInline(node ? Object.fromEntries(
+		const computed = node ? getComputedStyle(node) : null
+		const twClasses = cssToTailwindInline(computed ? Object.fromEntries(
 			["display", "position", "flex-direction", "justify-content", "align-items", "gap",
 			"margin", "padding", "width", "height", "font-size", "font-weight",
 			"text-align", "text-transform", "border-radius", "overflow", "cursor"]
-			.map((p) => [p, getComputedStyle(node).getPropertyValue(p)])
+			.map((p) => [p, computed.getPropertyValue(p)])
 			.filter(([, v]) => v)
 		) : {})
-		addCopyButton(panel, "🎨 Tailwind Classes", twClasses.join(" "), "Mapped Tailwind v3 utility classes for this element")
+		addCopyButton(panel, "palette", "Tailwind classes", twClasses.join(" "), "Mapped Tailwind v3 utility classes for this element")
 
 		const cssVars = extractCssVarsFromNode(node)
-		addCopyButton(panel, "🎯 CSS Variables / Tokens", cssVars, "Design tokens extracted as CSS custom properties")
+		addCopyButton(panel, "target", "CSS variables / tokens", cssVars, "Design tokens extracted as CSS custom properties")
 
 		const jsxCode = htmlToJsxInline(cleanHtml)
 		const jsxFull = `function Component() {\n\treturn (\n${jsxCode.split("\n").map((l) => "\t\t" + l).join("\n")}\n\t)\n}`
-		addCopyButton(panel, "⚛️ React / JSX Skeleton", jsxFull, "JSX component skeleton with className, self-closing tags")
+		addCopyButton(panel, "code", "React / JSX skeleton", jsxFull, "JSX component skeleton with className, self-closing tags")
 
 		const vueSfc = `<template>\n${cleanHtml.split("\n").map((l) => "\t" + l).join("\n")}\n</template>\n\n<script setup>\n</script>\n\n<style scoped>\n${cleanCss}\n</style>`
-		addCopyButton(panel, "💚 Vue SFC Skeleton", vueSfc, "Single-file component for Vue 3 with scoped styles")
+		addCopyButton(panel, "layers", "Vue SFC skeleton", vueSfc, "Single-file component for Vue 3 with scoped styles")
 
 		const aiPrompt = generateAiPromptInline(cleanHtml, cleanCss, node)
-		addCopyButton(panel, "🤖 AI-Ready Prompt", aiPrompt, "Structured prompt for ChatGPT/Claude/Copilot to recreate this component")
+		addCopyButton(panel, "sparkle", "AI-ready prompt", aiPrompt, "Structured prompt for ChatGPT/Claude/Copilot to recreate this component")
 
 		return panel
 	}
 
-	function addCopyButton(parent, label, content, description) {
+	function addCopyButton(parent, iconName, label, content, description) {
 		const card = el("div")
-		card.style.cssText = "background: rgba(255,255,255,0.03) !important; border: 1px solid rgba(255,255,255,0.06) !important; border-radius: 8px !important; padding: 12px 14px !important; margin-bottom: 8px !important; cursor: pointer !important; transition: all 0.15s !important;"
-		card.addEventListener("mouseenter", () => { card.style.borderColor = "rgba(59,130,246,0.4)" })
-		card.addEventListener("mouseleave", () => { card.style.borderColor = "rgba(255,255,255,0.06)" })
+		card.style.cssText = "background: rgba(243,236,224,0.03) !important; border: 1px solid rgba(243,236,224,0.06) !important; border-radius: 8px !important; padding: 12px 14px !important; margin-bottom: 8px !important; cursor: pointer !important; transition: all 0.15s !important;"
+		card.addEventListener("mouseenter", () => { card.style.borderColor = "rgba(255, 90, 31,0.4)" })
+		card.addEventListener("mouseleave", () => { card.style.borderColor = "rgba(243,236,224,0.06)" })
 		const row = el("div")
 		row.style.cssText = "display: flex !important; justify-content: space-between !important; align-items: center !important;"
 		const labelEl = el("span")
-		labelEl.textContent = label
-		labelEl.style.cssText = "font-size: 13px !important; font-weight: 600 !important; color: #f1f5f9 !important;"
+		labelEl.style.cssText = "display: inline-flex !important; align-items: center !important; gap: 8px !important; font-size: 13px !important; font-weight: 600 !important; color: #f3ece0 !important;"
+		labelEl.appendChild(icon(iconName, 14))
+		labelEl.appendChild(document.createTextNode(label))
 		const badge = el("span")
 		badge.textContent = "Copy"
-		badge.style.cssText = "font-size: 10px !important; font-weight: 600 !important; padding: 3px 8px !important; border-radius: 4px !important; background: rgba(59,130,246,0.15) !important; color: #60a5fa !important;"
+		badge.style.cssText = "font-size: 10px !important; font-weight: 600 !important; padding: 3px 8px !important; border-radius: 6px !important; background: rgba(255, 90, 31,0.15) !important; color: #ff8a5c !important;"
 		row.append(labelEl, badge)
 		const descEl = el("div")
 		descEl.textContent = description
-		descEl.style.cssText = "font-size: 11px !important; color: #64748b !important; margin-top: 4px !important;"
+		descEl.style.cssText = "font-size: 11px !important; color: #857a68 !important; margin-top: 4px !important;"
 		card.append(row, descEl)
 		card.addEventListener("click", (e) => {
 			e.preventDefault()
 			e.stopPropagation()
 			copy(content)
-			badge.textContent = "✓ Copied!"
-			badge.style.color = "#34d399"
-			badge.style.background = "rgba(16,185,129,0.15)"
+			badge.textContent = "Copied"
+			badge.style.color = "#2dd4bf"
+			badge.style.background = "rgba(20, 184, 166,0.15)"
 			setTimeout(() => {
 				badge.textContent = "Copy"
-				badge.style.color = "#60a5fa"
-				badge.style.background = "rgba(59,130,246,0.15)"
+				badge.style.color = "#ff8a5c"
+				badge.style.background = "rgba(255, 90, 31,0.15)"
 			}, 1500)
 		})
 		parent.appendChild(card)
@@ -1687,7 +1706,7 @@
 
 		const title = el("h4")
 		title.textContent = "Box Model"
-		title.style.cssText = "margin: 0 0 12px 0 !important; font-size: 13px !important; font-weight: 700 !important; color: #f8fafc !important;"
+		title.style.cssText = "margin: 0 0 12px 0 !important; font-size: 13px !important; font-weight: 700 !important; color: #f3ece0 !important;"
 		panel.appendChild(title)
 
 		const diagram = buildBoxModelDiagram(info)
@@ -1697,20 +1716,20 @@
 		if (data?.typography) {
 			const typTitle = el("h4")
 			typTitle.textContent = "Typography"
-			typTitle.style.cssText = "margin: 20px 0 8px 0 !important; font-size: 13px !important; font-weight: 700 !important; color: #f8fafc !important;"
+			typTitle.style.cssText = "margin: 20px 0 8px 0 !important; font-size: 13px !important; font-weight: 700 !important; color: #f3ece0 !important;"
 			panel.appendChild(typTitle)
 			const typGrid = el("div")
 			typGrid.style.cssText = "display: grid !important; grid-template-columns: 1fr 1fr !important; gap: 6px !important;"
 			for (const [key, value] of Object.entries(data.typography)) {
 				if (!value || value === "normal" || value === "none") continue
 				const cell = el("div")
-				cell.style.cssText = "display: flex !important; justify-content: space-between !important; padding: 4px 8px !important; background: rgba(255,255,255,0.03) !important; border-radius: 4px !important; font-size: 11px !important;"
+				cell.style.cssText = "display: flex !important; justify-content: space-between !important; padding: 4px 8px !important; background: rgba(243,236,224,0.03) !important; border-radius: 6px !important; font-size: 11px !important;"
 				const k = el("span")
 				k.textContent = key.replace(/([A-Z])/g, "-$1").toLowerCase()
-				k.style.cssText = "color: #64748b !important;"
+				k.style.cssText = "color: #857a68 !important;"
 				const v = el("span")
 				v.textContent = String(value).slice(0, 30)
-				v.style.cssText = "color: #e2e8f0 !important; font-family: ui-monospace, monospace !important; font-size: 10px !important;"
+				v.style.cssText = "color: #f3ece0 !important; font-family: ui-monospace, monospace !important; font-size: 10px !important;"
 				cell.append(k, v)
 				typGrid.appendChild(cell)
 			}
@@ -1720,23 +1739,23 @@
 		if (data?.colors) {
 			const colTitle = el("h4")
 			colTitle.textContent = "Colors & Contrast"
-			colTitle.style.cssText = "margin: 20px 0 8px 0 !important; font-size: 13px !important; font-weight: 700 !important; color: #f8fafc !important;"
+			colTitle.style.cssText = "margin: 20px 0 8px 0 !important; font-size: 13px !important; font-weight: 700 !important; color: #f3ece0 !important;"
 			panel.appendChild(colTitle)
 			const colGrid = el("div")
 			colGrid.style.cssText = "display: flex !important; gap: 8px !important; flex-wrap: wrap !important;"
 			for (const [key, value] of Object.entries(data.colors)) {
 				if (!value || key === "contrast") continue
 				const swatch = el("div")
-				swatch.style.cssText = `display: flex !important; align-items: center !important; gap: 6px !important; padding: 6px 10px !important; background: rgba(255,255,255,0.03) !important; border-radius: 6px !important; cursor: pointer !important;`
+				swatch.style.cssText = `display: flex !important; align-items: center !important; gap: 6px !important; padding: 6px 10px !important; background: rgba(243,236,224,0.03) !important; border-radius: 6px !important; cursor: pointer !important;`
 				const dot = el("span")
-				dot.style.cssText = `width: 16px !important; height: 16px !important; border-radius: 4px !important; background: ${value} !important; border: 1px solid rgba(255,255,255,0.15) !important; flex-shrink: 0 !important;`
+				dot.style.cssText = `width: 16px !important; height: 16px !important; border-radius: 6px !important; background: ${value} !important; border: 1px solid rgba(243,236,224,0.15) !important; flex-shrink: 0 !important;`
 				const info2 = el("div")
 				const label = el("div")
 				label.textContent = key
-				label.style.cssText = "font-size: 10px !important; color: #64748b !important;"
+				label.style.cssText = "font-size: 10px !important; color: #857a68 !important;"
 				const val = el("div")
 				val.textContent = value
-				val.style.cssText = "font-size: 11px !important; font-family: ui-monospace, monospace !important; color: #e2e8f0 !important;"
+				val.style.cssText = "font-size: 11px !important; font-family: ui-monospace, monospace !important; color: #f3ece0 !important;"
 				info2.append(label, val)
 				swatch.append(dot, info2)
 				swatch.addEventListener("click", (e) => {
@@ -1751,8 +1770,8 @@
 				const contrastBadge = el("div")
 				const ratio = data.colors.contrast
 				const pass = ratio >= 4.5
-				contrastBadge.textContent = `Contrast: ${ratio}:1 ${pass ? "✓ AA" : "✗ Fail"}`
-				contrastBadge.style.cssText = `padding: 6px 12px !important; border-radius: 6px !important; font-size: 12px !important; font-weight: 600 !important; background: ${pass ? "rgba(16,185,129,0.12)" : "rgba(248,113,113,0.12)"} !important; color: ${pass ? "#34d399" : "#f87171"} !important;`
+				contrastBadge.textContent = `Contrast ${ratio}:1 · AA ${pass ? "pass" : "fail"}`
+				contrastBadge.style.cssText = `padding: 6px 12px !important; border-radius: 6px !important; font-size: 12px !important; font-weight: 600 !important; background: ${pass ? "rgba(20, 184, 166,0.12)" : "rgba(255, 107, 107,0.12)"} !important; color: ${pass ? "#2dd4bf" : "#ff6b6b"} !important;`
 				colGrid.appendChild(contrastBadge)
 			}
 			panel.appendChild(colGrid)
@@ -1775,8 +1794,8 @@
 			highlight.style.left = `${Math.round(rect.left)}px`
 			highlight.style.width = `${Math.max(2, Math.round(rect.width))}px`
 			highlight.style.height = `${Math.max(2, Math.round(rect.height))}px`
-			highlight.style.border = "2px dashed #f59e0b !important"
-			highlight.style.background = "rgba(245, 158, 11, 0.08) !important"
+			highlight.style.setProperty("border", "2px dashed #f5b13d", "important")
+			highlight.style.setProperty("background", "rgba(245, 177, 61, 0.08)", "important")
 		}
 
 		if (inspectorDrawer) showInspectorDrawer(componentBoundary)
@@ -1795,79 +1814,217 @@
 			highlight.style.left = `${Math.round(rect.left)}px`
 			highlight.style.width = `${Math.max(2, Math.round(rect.width))}px`
 			highlight.style.height = `${Math.max(2, Math.round(rect.height))}px`
-			highlight.style.border = "2px solid #3b82f6 !important"
-			highlight.style.background = "rgba(59, 130, 246, 0.08) !important"
+			highlight.style.setProperty("border", "1.5px solid #ff5a1f", "important")
+			highlight.style.setProperty("background", "rgba(255, 90, 31, 0.08)", "important")
 		}
 		if (inspectorDrawer) showInspectorDrawer(componentBoundary)
 		updateFloatingCta("Sidekick: Inspector", `Contracted to <${componentBoundary.tagName.toLowerCase()}>`)
 	}
 
-	let measureState = { active: false, first: null, line: null, label: null }
+	// Measure tool: hover shows the element size, click pins an anchor, then hovering another
+	// element shows the pixel gaps between them (like holding Alt in Figma). Esc unpins, then exits.
+	const measure = { anchor: null, hover: null, layer: null, svg: null, labels: [] }
 
-	function toggleMeasureMode() {
-		measureState.active = !measureState.active
-		if (measureState.active) {
-			measureState.first = null
-			showFloatingCta("Sidekick: Measure", "Click first element, then second to measure distance", () => toggleMeasureMode())
-			document.addEventListener("click", onMeasureClick, true)
+	function measureLayer() {
+		if (!measure.layer || !measure.layer.isConnected) {
+			measure.layer = el("div", "sk-measure-layer")
+			measure.svg = document.createElementNS(SVG_NS, "svg")
+			measure.svg.setAttribute("class", "sk-measure-svg")
+			measure.layer.appendChild(measure.svg)
+			getShadowRoot().appendChild(measure.layer)
+		}
+		return measure.layer
+	}
+
+	function svgEl(name, attrs) {
+		const node = document.createElementNS(SVG_NS, name)
+		for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, String(value))
+		measure.svg.appendChild(node)
+		return node
+	}
+
+	function measureLabel(text, x, y, variant = "") {
+		const label = el("div", `sk-measure-label${variant ? ` ${variant}` : ""}`)
+		label.textContent = text
+		label.style.left = `${Math.round(x)}px`
+		label.style.top = `${Math.round(y)}px`
+		measure.layer.appendChild(label)
+	}
+
+	function fmtPx(value) {
+		const rounded = Math.round(value * 10) / 10
+		return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)
+	}
+
+	function drawGap(x1, y1, x2, y2) {
+		const length = Math.abs(x2 - x1) + Math.abs(y2 - y1)
+		if (length < 0.5) return
+		svgEl("line", { x1, y1, x2, y2, stroke: "#ff5a1f", "stroke-width": 1.5 })
+		const vertical = x1 === x2
+		const cap = 4
+		if (vertical) {
+			svgEl("line", { x1: x1 - cap, y1, x2: x1 + cap, y2: y1, stroke: "#ff5a1f", "stroke-width": 1.5 })
+			svgEl("line", { x1: x2 - cap, y1: y2, x2: x2 + cap, y2, stroke: "#ff5a1f", "stroke-width": 1.5 })
 		} else {
-			document.removeEventListener("click", onMeasureClick, true)
-			if (measureState.line?.parentNode) measureState.line.parentNode.removeChild(measureState.line)
-			if (measureState.label?.parentNode) measureState.label.parentNode.removeChild(measureState.label)
-			measureState = { active: false, first: null, line: null, label: null }
-			hideFloatingCta()
+			svgEl("line", { x1, y1: y1 - cap, x2: x1, y2: y1 + cap, stroke: "#ff5a1f", "stroke-width": 1.5 })
+			svgEl("line", { x1: x2, y1: y2 - cap, x2, y2: y2 + cap, stroke: "#ff5a1f", "stroke-width": 1.5 })
+		}
+		measureLabel(fmtPx(length), (x1 + x2) / 2, (y1 + y2) / 2)
+	}
+
+	function guide(x1, y1, x2, y2) {
+		svgEl("line", { x1, y1, x2, y2, stroke: "#ff5a1f", "stroke-width": 1, "stroke-dasharray": "3 3", opacity: 0.7 })
+	}
+
+	function outlineRect(rect, color, dashed = false) {
+		svgEl("rect", {
+			x: rect.left,
+			y: rect.top,
+			width: Math.max(0, rect.width),
+			height: Math.max(0, rect.height),
+			fill: "none",
+			stroke: color,
+			"stroke-width": 1.5,
+			...(dashed ? { "stroke-dasharray": "4 3" } : {}),
+		})
+	}
+
+	function contains(outer, inner) {
+		return inner.left >= outer.left && inner.right <= outer.right && inner.top >= outer.top && inner.bottom <= outer.bottom
+	}
+
+	function drawDistances(a, b) {
+		if (contains(a, b) || contains(b, a)) {
+			const outer = contains(a, b) ? a : b
+			const inner = outer === a ? b : a
+			const cx = inner.left + inner.width / 2
+			const cy = inner.top + inner.height / 2
+			drawGap(cx, outer.top, cx, inner.top)
+			drawGap(cx, inner.bottom, cx, outer.bottom)
+			drawGap(outer.left, cy, inner.left, cy)
+			drawGap(inner.right, cy, outer.right, cy)
+			return
+		}
+		const overlapTop = Math.max(a.top, b.top)
+		const overlapBottom = Math.min(a.bottom, b.bottom)
+		const overlapLeft = Math.max(a.left, b.left)
+		const overlapRight = Math.min(a.right, b.right)
+		if (b.left >= a.right || a.left >= b.right) {
+			const [x1, x2] = b.left >= a.right ? [a.right, b.left] : [b.right, a.left]
+			const y = overlapBottom > overlapTop ? (overlapTop + overlapBottom) / 2 : b.top + b.height / 2
+			drawGap(x1, y, x2, y)
+			if (!(overlapBottom > overlapTop)) {
+				const edgeX = b.left >= a.right ? a.right : a.left
+				guide(edgeX, a.top + a.height / 2, edgeX, y)
+			}
+		}
+		if (b.top >= a.bottom || a.top >= b.bottom) {
+			const [y1, y2] = b.top >= a.bottom ? [a.bottom, b.top] : [b.bottom, a.top]
+			const x = overlapRight > overlapLeft ? (overlapLeft + overlapRight) / 2 : b.left + b.width / 2
+			drawGap(x, y1, x, y2)
+			if (!(overlapRight > overlapLeft)) {
+				const edgeY = b.top >= a.bottom ? a.bottom : a.top
+				guide(a.left + a.width / 2, edgeY, x, edgeY)
+			}
 		}
 	}
 
+	function renderMeasure() {
+		if (!state.measure) return
+		measureLayer()
+		const hoverRect = measure.hover?.isConnected ? measure.hover.getBoundingClientRect() : null
+		const anchorRect = measure.anchor?.isConnected ? measure.anchor.getBoundingClientRect() : null
+		measure.svg.textContent = ""
+		for (const label of measure.layer.querySelectorAll(".sk-measure-label")) label.remove()
+		if (anchorRect) {
+			outlineRect(anchorRect, "#14b8a6")
+			measureLabel(`${fmtPx(anchorRect.width)} × ${fmtPx(anchorRect.height)}`, anchorRect.left + anchorRect.width / 2, anchorRect.bottom + 4, "sk-size sk-anchor")
+		}
+		if (hoverRect && measure.hover !== measure.anchor) {
+			outlineRect(hoverRect, "#ff5a1f", Boolean(anchorRect))
+			if (anchorRect) drawDistances(anchorRect, hoverRect)
+			else measureLabel(`${fmtPx(hoverRect.width)} × ${fmtPx(hoverRect.height)}`, hoverRect.left + hoverRect.width / 2, hoverRect.bottom + 4, "sk-size")
+		}
+	}
+
+	const scheduleMeasure = rafThrottle(renderMeasure)
+
+	function onMeasureMove(event) {
+		if (isDevKitEvent(event)) return
+		const node = event.target
+		if (!(node instanceof Element) || node === measure.hover) return
+		measure.hover = node
+		scheduleMeasure()
+	}
+
 	function onMeasureClick(event) {
-		if (!measureState.active) return
 		if (isDevKitEvent(event)) return
 		const node = event.target
 		if (!(node instanceof Element)) return
 		event.preventDefault()
 		event.stopPropagation()
+		measure.anchor = measure.anchor === node ? null : node
+		updateFloatingCta(
+			"Sidekick: Measure",
+			measure.anchor
+				? `Pinned <${node.tagName.toLowerCase()}>, hover another element for distances · Esc to unpin`
+				: "Hover to see sizes · Click to pin an element · Esc to exit",
+		)
+		scheduleMeasure()
+	}
 
-		if (!measureState.first) {
-			measureState.first = node
-			updateFloatingCta("Sidekick: Measure", `First: <${node.tagName.toLowerCase()}> — now click second element`)
+	function onMeasureKey(event) {
+		if (event.key !== "Escape") return
+		event.preventDefault()
+		event.stopPropagation()
+		if (measure.anchor) {
+			measure.anchor = null
+			updateFloatingCta("Sidekick: Measure", "Hover to see sizes · Click to pin an element · Esc to exit")
+			scheduleMeasure()
 		} else {
-			const r1 = measureState.first.getBoundingClientRect()
-			const r2 = node.getBoundingClientRect()
-			const cx1 = r1.left + r1.width / 2
-			const cy1 = r1.top + r1.height / 2
-			const cx2 = r2.left + r2.width / 2
-			const cy2 = r2.top + r2.height / 2
-			const dist = Math.round(Math.sqrt((cx2 - cx1) ** 2 + (cy2 - cy1) ** 2))
-			const dx = Math.abs(Math.round(cx2 - cx1))
-			const dy = Math.abs(Math.round(cy2 - cy1))
-
-			ensureStyles()
-			if (measureState.line?.parentNode) measureState.line.parentNode.removeChild(measureState.line)
-			const line = document.createElementNS("http://www.w3.org/2000/svg", "svg")
-			line.setAttribute("class", "dk-root")
-			line.style.cssText = "position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important; pointer-events: none !important; z-index: 2147483645 !important;"
-			const svgLine = document.createElementNS("http://www.w3.org/2000/svg", "line")
-			svgLine.setAttribute("x1", cx1)
-			svgLine.setAttribute("y1", cy1)
-			svgLine.setAttribute("x2", cx2)
-			svgLine.setAttribute("y2", cy2)
-			svgLine.setAttribute("stroke", "#f59e0b")
-			svgLine.setAttribute("stroke-width", "2")
-			svgLine.setAttribute("stroke-dasharray", "6 3")
-			line.appendChild(svgLine)
-			getShadowRoot().appendChild(line)
-			measureState.line = line
-
-			if (measureState.label?.parentNode) measureState.label.parentNode.removeChild(measureState.label)
-			const lbl = el("div", "dk-root")
-			lbl.style.cssText = `position: fixed !important; z-index: 2147483646 !important; top: ${Math.min(cy1, cy2) + Math.abs(cy2 - cy1) / 2 - 12}px !important; left: ${Math.min(cx1, cx2) + Math.abs(cx2 - cx1) / 2 + 8}px !important; background: rgba(15,23,42,0.95) !important; color: #fbbf24 !important; padding: 4px 10px !important; border-radius: 6px !important; font-size: 12px !important; font-weight: 600 !important; font-family: ui-monospace, monospace !important; border: 1px solid rgba(245,158,11,0.4) !important; pointer-events: none !important;`
-			lbl.textContent = `${dist}px (↔${dx} ↕${dy})`
-			getShadowRoot().appendChild(lbl)
-			measureState.label = lbl
-
-			updateFloatingCta("Sidekick: Measure", `Distance: ${dist}px (↔${dx} ↕${dy}) — click new pair or close`)
-			measureState.first = null
+			toggleMeasure(false)
 		}
+	}
+
+	function swallowPointer(event) {
+		if (!isDevKitEvent(event)) {
+			event.preventDefault()
+			event.stopPropagation()
+		}
+	}
+
+	function toggleMeasure(on) {
+		const next = on ?? !state.measure
+		if (next === state.measure) return state.measure
+		state.measure = next
+		if (next) {
+			measure.anchor = null
+			measure.hover = null
+			document.addEventListener("mouseover", onMeasureMove, true)
+			document.addEventListener("click", onMeasureClick, true)
+			document.addEventListener("mousedown", swallowPointer, true)
+			document.addEventListener("keydown", onMeasureKey, true)
+			window.addEventListener("scroll", scheduleMeasure, true)
+			window.addEventListener("resize", scheduleMeasure)
+			showFloatingCta("Sidekick: Measure", "Hover to see sizes · Click to pin an element · Esc to exit", () => toggleMeasure(false))
+			registerCleanup("measure", () => toggleMeasure(false))
+		} else {
+			document.removeEventListener("mouseover", onMeasureMove, true)
+			document.removeEventListener("click", onMeasureClick, true)
+			document.removeEventListener("mousedown", swallowPointer, true)
+			document.removeEventListener("keydown", onMeasureKey, true)
+			window.removeEventListener("scroll", scheduleMeasure, true)
+			window.removeEventListener("resize", scheduleMeasure)
+			scheduleMeasure.cancel()
+			measure.layer?.remove()
+			measure.layer = null
+			measure.svg = null
+			measure.anchor = null
+			measure.hover = null
+			activeCleanups.delete("measure")
+			hideFloatingCta()
+		}
+		return state.measure
 	}
 
 	function onInspectKeyDown(event) {
@@ -1886,7 +2043,8 @@
 			toggleOutline()
 		} else if (event.key === "m" || event.key === "M") {
 			event.preventDefault()
-			toggleMeasureMode()
+			setInspect(false)
+			toggleMeasure(true)
 		} else if (event.key === "Escape") {
 			if (inspectorDrawer) {
 				hideInspectorDrawer()
@@ -1901,19 +2059,22 @@
 			document.addEventListener("mousemove", onMove, true)
 			document.addEventListener("click", onClickInspect, true)
 			document.addEventListener("keydown", onInspectKeyDown, true)
-			showFloatingCta("Sidekick: Element Inspector", "Hover to preview • Click for full report • [ ] expand/contract • M measure • X x-ray", () => setInspect(false))
+			showFloatingCta("Sidekick: Element Inspector", "Hover to preview · Click for full report · [ ] expand/contract · M measure · X outlines", () => setInspect(false))
+			registerCleanup("inspect", () => setInspect(false))
 		} else {
 			document.removeEventListener("mousemove", onMove, true)
 			document.removeEventListener("click", onClickInspect, true)
 			document.removeEventListener("keydown", onInspectKeyDown, true)
+			renderInspectHover.cancel()
+			lastHoverTarget = null
 			if (highlight?.parentNode) highlight.parentNode.removeChild(highlight)
 			highlight = null
 			inspectedNode = null
 			componentBoundary = null
+			activeCleanups.delete("inspect")
 			hideHud()
 			hideInspectorDrawer()
 			hideFloatingCta()
-			if (measureState.active) toggleMeasureMode()
 		}
 		return state.inspect
 	}
@@ -1981,41 +2142,35 @@
 		return state.grid
 	}
 
+	let outlineCulprits = []
 	function toggleOutline() {
 		state.outline = !state.outline
-		ensureStyles()
 		document.documentElement.classList.toggle("dk-outline-all", state.outline)
 		if (state.outline) {
+			ensurePageStyles()
 			const docWidth = document.documentElement.clientWidth || window.innerWidth
 			const culprits = []
-			try {
-				const all = document.querySelectorAll("body *:not(.dk-root):not(.dk-root *)")
-				for (const node of all) {
-					const rect = node.getBoundingClientRect()
-					if (rect.width > 0 && rect.height > 0) {
-						if (rect.right > docWidth + 2 || rect.left < -2) {
-							node.classList.add("dk-overflow-culprit")
-							culprits.push(node)
-						}
-					}
-				}
-			} catch {
-
-			}
-
+			const scan = scanElements("body *", (node) => {
+				const rect = node.getBoundingClientRect()
+				if (rect.width > 0 && rect.height > 0 && (rect.right > docWidth + 2 || rect.left < -2)) culprits.push(node)
+			}, { limit: 8000, ms: 300 })
+			// Class writes happen after every read so the scan never forces a style recalc per element.
+			for (const node of culprits) node.classList.add("dk-overflow-culprit")
+			outlineCulprits = culprits
+			const scanned = scan.truncated ? ` (first ${scan.scanned} of ${scan.total} elements)` : ""
 			const msg = culprits.length > 0
-				? `All DOM elements outlined · ⚠️ ${culprits.length} overflow culprit${culprits.length === 1 ? "" : "s"} highlighted`
-				: "All DOM elements outlined · No horizontal overflow detected"
-			showFloatingCta("Sidekick: CSS Outlines", msg, () => toggleOutline())
+				? `All elements outlined · ${culprits.length} horizontal overflow culprit${culprits.length === 1 ? "" : "s"} marked${scanned}`
+				: `All elements outlined · No horizontal overflow detected${scanned}`
+			showFloatingCta("Sidekick: CSS Outlines", msg, () => {
+				if (state.outline) toggleOutline()
+			})
+			registerCleanup("outline", () => {
+				if (state.outline) toggleOutline()
+			})
 		} else {
-			try {
-				const prev = document.querySelectorAll(".dk-overflow-culprit")
-				for (const el of prev) {
-					el.classList.remove("dk-overflow-culprit")
-				}
-			} catch {
-
-			}
+			for (const node of outlineCulprits) node.classList.remove("dk-overflow-culprit")
+			outlineCulprits = []
+			activeCleanups.delete("outline")
 			hideFloatingCta()
 		}
 		return state.outline
@@ -2087,7 +2242,7 @@
 		editSelectedElement.dataset.dkDy = String(dy)
 		const base = editSelectedElement.dataset.dkOrigTransform || ""
 		editSelectedElement.style.transform = `${base} translate(${dx}px, ${dy}px)`.trim()
-		updateEditOverlay()
+		scheduleEditPosition()
 		updateFloatingCta("Sidekick: Design & Move", `Offset: X ${dx >= 0 ? "+" : ""}${dx}px, Y ${dy >= 0 ? "+" : ""}${dy}px · Drag to move · Esc to deselect`)
 	}
 
@@ -2162,12 +2317,7 @@
 
 		if (!editHighlightBox) {
 			editHighlightBox = el("div", "dk-edit-selected")
-			editHighlightBox.innerHTML = `
-				<div class="dk-edit-handle dk-edit-handle-tl" style="position: absolute !important; top: -5px !important; left: -5px !important; width: 8px !important; height: 8px !important; background: #ffffff !important; border: 2px solid #3b82f6 !important; border-radius: 1px !important; pointer-events: none !important;"></div>
-				<div class="dk-edit-handle dk-edit-handle-tr" style="position: absolute !important; top: -5px !important; right: -5px !important; width: 8px !important; height: 8px !important; background: #ffffff !important; border: 2px solid #3b82f6 !important; border-radius: 1px !important; pointer-events: none !important;"></div>
-				<div class="dk-edit-handle dk-edit-handle-bl" style="position: absolute !important; bottom: -5px !important; left: -5px !important; width: 8px !important; height: 8px !important; background: #ffffff !important; border: 2px solid #3b82f6 !important; border-radius: 1px !important; pointer-events: none !important;"></div>
-				<div class="dk-edit-handle dk-edit-handle-br" style="position: absolute !important; bottom: -5px !important; right: -5px !important; width: 8px !important; height: 8px !important; background: #ffffff !important; border: 2px solid #3b82f6 !important; border-radius: 1px !important; pointer-events: none !important;"></div>
-			`
+			for (const corner of ["tl", "tr", "bl", "br"]) editHighlightBox.appendChild(el("div", `dk-edit-handle dk-edit-handle-${corner}`))
 			editHighlightBox.addEventListener("mousedown", (e) => {
 				e.preventDefault()
 				e.stopPropagation()
@@ -2187,7 +2337,7 @@
 			})
 			getShadowRoot().appendChild(editHighlightBox)
 		}
-		editHighlightBox.style.cssText = `position: fixed !important; top: ${rect.top}px !important; left: ${rect.left}px !important; width: ${rect.width}px !important; height: ${rect.height}px !important; z-index: 2147483645 !important; pointer-events: auto !important; border: 2px solid #3b82f6 !important; background: rgba(59, 130, 246, 0.12) !important; border-radius: 2px !important; box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.9), 0 0 20px rgba(59, 130, 246, 0.5) !important; cursor: grab !important; box-sizing: border-box !important; display: block !important;`
+		editHighlightBox.style.cssText = `position: fixed !important; top: ${rect.top}px !important; left: ${rect.left}px !important; width: ${rect.width}px !important; height: ${rect.height}px !important; z-index: 2147483645 !important; pointer-events: auto !important; border: 2px solid #ff5a1f !important; background: rgba(255, 90, 31, 0.12) !important; border-radius: 2px !important; box-shadow: 0 0 0 1px rgba(243, 236, 224, 0.9), 0 0 20px rgba(255, 90, 31, 0.5) !important; cursor: grab !important; box-sizing: border-box !important; display: block !important;`
 
 		if (!editToolbar) {
 			editToolbar = el("div", "dk-edit-toolbar")
@@ -2195,19 +2345,19 @@
 		}
 		const topPos = Math.max(8, rect.top - 48)
 		const leftPos = Math.max(8, Math.min(window.innerWidth - 520, rect.left))
-		editToolbar.style.cssText = `position: fixed !important; top: ${topPos}px !important; left: ${leftPos}px !important; z-index: 2147483646 !important; display: flex !important; align-items: center !important; gap: 4px !important; background: #0b1120 !important; background: rgba(11, 17, 32, 0.98) !important; backdrop-filter: blur(16px) !important; -webkit-backdrop-filter: blur(16px) !important; border: 1.5px solid #3b82f6 !important; border-radius: 8px !important; padding: 5px 8px !important; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8), 0 0 15px rgba(59, 130, 246, 0.3) !important; font-size: 11.5px !important; pointer-events: auto !important; white-space: nowrap !important; max-width: 95vw !important; overflow-x: auto !important;`
+		editToolbar.style.cssText = `position: fixed !important; top: ${topPos}px !important; left: ${leftPos}px !important; z-index: 2147483646 !important; display: flex !important; align-items: center !important; gap: 4px !important; background: #17140f !important; background: rgba(23, 20, 15, 0.98) !important; backdrop-filter: blur(16px) !important; -webkit-backdrop-filter: blur(16px) !important; border: 1.5px solid #ff5a1f !important; border-radius: 8px !important; padding: 5px 8px !important; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8), 0 0 15px rgba(255, 90, 31, 0.3) !important; font-size: 11.5px !important; pointer-events: auto !important; white-space: nowrap !important; max-width: 95vw !important; overflow-x: auto !important;`
 
-		editToolbar.innerHTML = ""
+		editToolbar.textContent = ""
 
-		function makeEditBtn(text, title, onClick, isDragGrip = false, isDelete = false) {
+		function makeEditBtn(iconName, text, title, onClick, isDragGrip = false, isDelete = false) {
 			const btn = el("button", "dk-edit-btn" + (isDragGrip ? " dk-drag-grip" : "") + (isDelete ? " dk-delete" : ""))
 			btn.type = "button"
-			btn.textContent = text
+			setButtonContent(btn, iconName, text)
 			btn.title = title
-			const bg = isDelete ? "rgba(239, 68, 68, 0.2)" : isDragGrip ? "rgba(59, 130, 246, 0.25)" : "rgba(255, 255, 255, 0.1)"
-			const color = isDelete ? "#fca5a5" : isDragGrip ? "#93c5fd" : "#f1f5f9"
-			const border = isDelete ? "1px solid rgba(239, 68, 68, 0.4)" : isDragGrip ? "1px solid rgba(59, 130, 246, 0.5)" : "1px solid rgba(255, 255, 255, 0.2)"
-			btn.style.cssText = `background: ${bg} !important; color: ${color} !important; border: ${border} !important; border-radius: 4px !important; padding: 4px 8px !important; font-size: 11px !important; cursor: ${isDragGrip ? "grab" : "pointer"} !important; font-weight: 600 !important; display: inline-flex !important; align-items: center !important; gap: 3px !important; user-select: none !important; line-height: 1.2 !important; white-space: nowrap !important;`
+			const bg = isDelete ? "rgba(255, 77, 77, 0.2)" : isDragGrip ? "rgba(255, 90, 31, 0.25)" : "rgba(243, 236, 224, 0.1)"
+			const color = isDelete ? "#ffb3a3" : isDragGrip ? "#ffb08a" : "#f3ece0"
+			const border = isDelete ? "1px solid rgba(255, 77, 77, 0.4)" : isDragGrip ? "1px solid rgba(255, 90, 31, 0.5)" : "1px solid rgba(243, 236, 224, 0.2)"
+			btn.style.cssText = `background: ${bg} !important; color: ${color} !important; border: ${border} !important; border-radius: 6px !important; padding: 4px 8px !important; font-size: 11px !important; cursor: ${isDragGrip ? "grab" : "pointer"} !important; font-weight: 600 !important; display: inline-flex !important; align-items: center !important; gap: 3px !important; user-select: none !important; line-height: 1.2 !important; white-space: nowrap !important;`
 			btn.addEventListener("mousedown", (e) => {
 				if (isDragGrip) {
 					e.preventDefault()
@@ -2230,7 +2380,7 @@
 		const chain = getAncestorChain(editSelectedElement)
 		if (chain.length > 1) {
 			const breadcrumbWrap = el("div", "dk-edit-breadcrumbs")
-			breadcrumbWrap.style.cssText = "display: inline-flex !important; align-items: center !important; gap: 2px !important; margin-right: 4px !important; padding-right: 6px !important; border-right: 1px solid rgba(255, 255, 255, 0.15) !important;"
+			breadcrumbWrap.style.cssText = "display: inline-flex !important; align-items: center !important; gap: 2px !important; margin-right: 4px !important; padding-right: 6px !important; border-right: 1px solid rgba(243, 236, 224, 0.15) !important;"
 			chain.forEach((anc, idx) => {
 				const isCurrent = anc === editSelectedElement
 				const ancTag = anc.tagName.toLowerCase()
@@ -2239,7 +2389,7 @@
 				crumbBtn.type = "button"
 				crumbBtn.title = `Select <${ancTag}${ancCls}>`
 				crumbBtn.textContent = `<${ancTag}${ancCls}>`
-				crumbBtn.style.cssText = `background: ${isCurrent ? "rgba(59, 130, 246, 0.3)" : "rgba(255, 255, 255, 0.06)"} !important; color: ${isCurrent ? "#93c5fd" : "#94a3b8"} !important; border: 1px solid ${isCurrent ? "#3b82f6" : "rgba(255, 255, 255, 0.1)"} !important; border-radius: 3px !important; padding: 2px 6px !important; font-size: 10.5px !important; font-family: ui-monospace, monospace !important; cursor: pointer !important; font-weight: ${isCurrent ? "700" : "500"} !important;`
+				crumbBtn.style.cssText = `background: ${isCurrent ? "rgba(255, 90, 31, 0.3)" : "rgba(243, 236, 224, 0.06)"} !important; color: ${isCurrent ? "#ffb08a" : "#b3a894"} !important; border: 1px solid ${isCurrent ? "#ff5a1f" : "rgba(243, 236, 224, 0.1)"} !important; border-radius: 3px !important; padding: 2px 6px !important; font-size: 10.5px !important; font-family: ui-monospace, monospace !important; cursor: pointer !important; font-weight: ${isCurrent ? "700" : "500"} !important;`
 				crumbBtn.addEventListener("click", (e) => {
 					e.preventDefault()
 					e.stopPropagation()
@@ -2249,14 +2399,14 @@
 				if (idx < chain.length - 1) {
 					const sep = el("span", "")
 					sep.textContent = "›"
-					sep.style.cssText = "color: #64748b !important; font-size: 11px !important; margin: 0 1px !important;"
+					sep.style.cssText = "color: #857a68 !important; font-size: 11px !important; margin: 0 1px !important;"
 					breadcrumbWrap.appendChild(sep)
 				}
 			})
 			editToolbar.appendChild(breadcrumbWrap)
 		} else {
 			const tagLabel = el("span", "dk-edit-tag-label")
-			tagLabel.style.cssText = "color: #60a5fa !important; font-weight: 700 !important; font-size: 11px !important; text-transform: uppercase !important; padding: 2px 6px !important; font-family: ui-monospace, SFMono-Regular, monospace !important; letter-spacing: 0.3px !important; white-space: nowrap !important;"
+			tagLabel.style.cssText = "color: #ff8a5c !important; font-weight: 700 !important; font-size: 11px !important; text-transform: uppercase !important; padding: 2px 6px !important; font-family: ui-monospace, SFMono-Regular, monospace !important; letter-spacing: 0.3px !important; white-space: nowrap !important;"
 			const idStr = editSelectedElement.id ? `#${editSelectedElement.id}` : ""
 			const classStr = typeof editSelectedElement.className === "string" && editSelectedElement.classList.length ? `.${editSelectedElement.classList[0]}` : ""
 			tagLabel.textContent = `<${editSelectedElement.tagName.toLowerCase()}${idStr || classStr}>`
@@ -2265,28 +2415,28 @@
 
 		if (editSelectedElement.parentElement && editSelectedElement.parentElement !== document.body && editSelectedElement.parentElement !== document.documentElement) {
 			const parentTag = editSelectedElement.parentElement.tagName.toLowerCase()
-			const parentBtn = makeEditBtn(`▲ Parent (${parentTag})`, "Select parent container div/section", () => {
+			const parentBtn = makeEditBtn("parent", `Parent (${parentTag})`, "Select parent container div/section", () => {
 				selectEditElement(editSelectedElement.parentElement)
 			})
 			editToolbar.appendChild(parentBtn)
 		}
 
 		if (editSelectedElement.firstElementChild) {
-			const childBtn = makeEditBtn("▼ Child", "Select first child element inside this container", () => {
+			const childBtn = makeEditBtn("child", "Child", "Select first child element inside this container", () => {
 				selectEditElement(editSelectedElement.firstElementChild)
 			})
 			editToolbar.appendChild(childBtn)
 		}
 
-		const gripBtn = makeEditBtn("⠿ Drag", "Click & hold to drag element anywhere on page", null, true)
+		const gripBtn = makeEditBtn("grip", "Drag", "Click & hold to drag element anywhere on page", null, true)
 		editToolbar.appendChild(gripBtn)
 
-		const editTextBtn = makeEditBtn("✏️ Edit", "Edit copy/text directly (or double click element)", () => {
+		const editTextBtn = makeEditBtn("edit", "Edit", "Edit copy/text directly (or double click element)", () => {
 			enableTextEdit(editSelectedElement)
 		})
 		editToolbar.appendChild(editTextBtn)
 
-		const dupBtn = makeEditBtn("⧉ Duplicate", "Duplicate component block", () => {
+		const dupBtn = makeEditBtn("duplicate", "Duplicate", "Duplicate component block", () => {
 			if (editSelectedElement?.parentNode) {
 				const clone = editSelectedElement.cloneNode(true)
 				delete clone.dataset.dkDx
@@ -2299,7 +2449,7 @@
 		})
 		editToolbar.appendChild(dupBtn)
 
-		const moveUpBtn = makeEditBtn("▲ Up", "Move element before previous sibling in DOM", () => {
+		const moveUpBtn = makeEditBtn("up", "Up", "Move element before previous sibling in DOM", () => {
 			if (editSelectedElement?.previousElementSibling) {
 				editSelectedElement.parentNode.insertBefore(editSelectedElement, editSelectedElement.previousElementSibling)
 				updateEditOverlay()
@@ -2308,7 +2458,7 @@
 		})
 		editToolbar.appendChild(moveUpBtn)
 
-		const moveDownBtn = makeEditBtn("▼ Down", "Move element after next sibling in DOM", () => {
+		const moveDownBtn = makeEditBtn("down", "Down", "Move element after next sibling in DOM", () => {
 			if (editSelectedElement?.nextElementSibling) {
 				editSelectedElement.parentNode.insertBefore(editSelectedElement.nextElementSibling, editSelectedElement)
 				updateEditOverlay()
@@ -2317,7 +2467,7 @@
 		})
 		editToolbar.appendChild(moveDownBtn)
 
-		const resetBtn = makeEditBtn("↺ Reset", "Reset moved position to original (0, 0)", () => {
+		const resetBtn = makeEditBtn("reset", "Reset", "Reset moved position to original (0, 0)", () => {
 			if (editSelectedElement) {
 				const orig = editSelectedElement.dataset.dkOrigTransform
 				if (orig !== undefined) {
@@ -2334,7 +2484,7 @@
 		})
 		editToolbar.appendChild(resetBtn)
 
-		const delBtn = makeEditBtn("🗑", "Delete element (or press Del key)", () => {
+		const delBtn = makeEditBtn("trash", null, "Delete element (or press Del key)", () => {
 			const target = editSelectedElement
 			clearEditSelection()
 			target?.remove()
@@ -2356,7 +2506,7 @@
 		const dy = editSelectedElement.dataset.dkDy || "0"
 		updateFloatingCta(
 			"Sidekick: Design & Move Mode",
-			`Selected <${target.tagName.toLowerCase()}> (X: ${dx}px, Y: ${dy}px) · Drag to move · ▲ Parent for container · Double-click to edit text`
+			`Selected <${target.tagName.toLowerCase()}> (X: ${dx}px, Y: ${dy}px) · Drag to move · Parent selects the container · Double-click to edit text`
 		)
 	}
 
@@ -2408,9 +2558,9 @@
 		ensureStyles()
 		if (!editHoverBox) {
 			editHoverBox = el("div", "dk-edit-hover-box")
-			editHoverBox.style.cssText = "position: fixed !important; z-index: 2147483643 !important; pointer-events: none !important; border: 2px dashed #3b82f6 !important; background: rgba(59, 130, 246, 0.08) !important; border-radius: 3px !important; transition: none !important; box-sizing: border-box !important;"
+			editHoverBox.style.cssText = "position: fixed !important; z-index: 2147483643 !important; pointer-events: none !important; border: 2px dashed #ff5a1f !important; background: rgba(255, 90, 31, 0.08) !important; border-radius: 3px !important; transition: none !important; box-sizing: border-box !important;"
 			const badge = el("div", "dk-hover-badge")
-			badge.style.cssText = "position: absolute !important; top: -20px !important; left: -2px !important; background: #3b82f6 !important; color: #ffffff !important; font-size: 10.5px !important; font-family: ui-monospace, monospace !important; font-weight: 700 !important; padding: 1px 6px !important; border-radius: 3px !important; pointer-events: none !important; white-space: nowrap !important; line-height: 1.4 !important; box-shadow: 0 2px 8px rgba(0,0,0,0.5) !important;"
+			badge.style.cssText = "position: absolute !important; top: -20px !important; left: -2px !important; background: #ff5a1f !important; color: #ffffff !important; font-size: 10.5px !important; font-family: ui-monospace, monospace !important; font-weight: 700 !important; padding: 1px 6px !important; border-radius: 3px !important; pointer-events: none !important; white-space: nowrap !important; line-height: 1.4 !important; box-shadow: 0 2px 8px rgba(0,0,0,0.5) !important;"
 			editHoverBox.appendChild(badge)
 			getShadowRoot().appendChild(editHoverBox)
 		}
@@ -2507,10 +2657,26 @@
 		}
 	}
 
-	function onEditScroll() {
-		if (state.edit && editSelectedElement) {
-			updateEditOverlay()
+	function positionEditOverlay() {
+		if (!state.edit || !editSelectedElement?.isConnected) return
+		const rect = editSelectedElement.getBoundingClientRect()
+		const toolbarWidth = editToolbar?.offsetWidth || 520
+		if (editHighlightBox) {
+			editHighlightBox.style.setProperty("top", `${rect.top}px`, "important")
+			editHighlightBox.style.setProperty("left", `${rect.left}px`, "important")
+			editHighlightBox.style.setProperty("width", `${rect.width}px`, "important")
+			editHighlightBox.style.setProperty("height", `${rect.height}px`, "important")
 		}
+		if (editToolbar) {
+			editToolbar.style.setProperty("top", `${Math.max(8, rect.top - 48)}px`, "important")
+			editToolbar.style.setProperty("left", `${Math.max(8, Math.min(window.innerWidth - toolbarWidth - 8, rect.left))}px`, "important")
+		}
+	}
+
+	const scheduleEditPosition = rafThrottle(positionEditOverlay)
+
+	function onEditScroll() {
+		if (state.edit && editSelectedElement) scheduleEditPosition()
 	}
 
 	function toggleEdit() {
@@ -2526,10 +2692,15 @@
 			window.addEventListener("resize", onEditScroll, true)
 			showFloatingCta(
 				"Sidekick: Design & Move Mode",
-				"Figma Mode active · Hover/click any element · Use '▲ Parent' for containers · Drag to move · Esc to deselect",
+				"Figma Mode active · Click any element · Parent selects containers · Drag to move · Esc deselects",
 				() => toggleEdit()
 			)
+			registerCleanup("edit", () => {
+				if (state.edit) toggleEdit()
+			})
 		} else {
+			scheduleEditPosition.cancel()
+			activeCleanups.delete("edit")
 			document.removeEventListener("mouseover", onEditMouseOver, true)
 			document.removeEventListener("mouseout", onEditMouseOut, true)
 			document.removeEventListener("click", onEditClick, true)
@@ -2553,7 +2724,8 @@
 		badge = null
 
 		if (!state.viewport) {
-			window.removeEventListener("resize", paintBadge)
+			window.removeEventListener("resize", onViewportResize)
+			onViewportResize.cancel()
 			hideFloatingCta()
 			try {
 				runtime.runtime.sendMessage({
@@ -2567,21 +2739,24 @@
 		badge = el("div", "dk-badge")
 		getShadowRoot().appendChild(badge)
 		paintBadge()
-		window.addEventListener("resize", paintBadge)
+		window.addEventListener("resize", onViewportResize)
 		showFloatingCta(
 			"Sidekick: Viewport Sizer",
 			"Live viewport HUD active · Resize browser window to test breakpoints",
 			() => toggleViewport(),
 			[
 				{
-					label: "📱 Simulate Device",
-					title: "Launch in-page device simulator directly on page",
-					action: () => toggleDeviceFrame({ width: 390, height: 844, label: "iPhone 14", icon: "📱" }),
+					icon: "phone",
+					label: "Simulate device",
+					title: "Open the in-page device simulator",
+					action: () => toggleDeviceFrame({ width: 390, height: 844, label: "iPhone 14" }),
 				},
 			]
 		)
 		return true
 	}
+
+	const onViewportResize = rafThrottle(() => paintBadge())
 
 	function bucket(width) {
 		if (width < 480) return "xs (mobile)"
@@ -2593,29 +2768,29 @@
 
 	function paintBadge() {
 		if (!badge) return
-		badge.innerHTML = ""
-		badge.style.cssText = "position: fixed !important; top: 16px !important; left: 50% !important; transform: translateX(-50%) !important; z-index: 2147483647 !important; display: inline-flex !important; align-items: center !important; gap: 10px !important; background: #0b1120 !important; background: rgba(11, 17, 32, 0.96) !important; backdrop-filter: blur(16px) !important; -webkit-backdrop-filter: blur(16px) !important; border: 1.5px solid #3b82f6 !important; border-radius: 9999px !important; padding: 8px 18px !important; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8), 0 0 20px rgba(59, 130, 246, 0.4) !important; font-size: 13px !important; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important; color: #ffffff !important; pointer-events: auto !important; line-height: 1 !important; white-space: nowrap !important; box-sizing: border-box !important;"
+		badge.textContent = ""
+		badge.style.cssText = "position: fixed !important; top: 16px !important; left: 50% !important; transform: translateX(-50%) !important; z-index: 2147483647 !important; display: inline-flex !important; align-items: center !important; gap: 10px !important; background: #17140f !important; background: rgba(23, 20, 15, 0.96) !important; backdrop-filter: blur(16px) !important; -webkit-backdrop-filter: blur(16px) !important; border: 1.5px solid #ff5a1f !important; border-radius: 12px !important; padding: 8px 18px !important; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8), 0 0 20px rgba(255, 90, 31, 0.4) !important; font-size: 13px !important; font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif !important; color: #ffffff !important; pointer-events: auto !important; line-height: 1 !important; white-space: nowrap !important; box-sizing: border-box !important;"
 
 		const dot = el("span", "dk-badge-dot")
-		dot.style.cssText = "width: 8px !important; height: 8px !important; border-radius: 50% !important; background: #10b981 !important; box-shadow: 0 0 8px #10b981 !important; flex-shrink: 0 !important;"
+		dot.style.cssText = "width: 8px !important; height: 8px !important; border-radius: 50% !important; background: #14b8a6 !important; box-shadow: 0 0 8px #14b8a6 !important; flex-shrink: 0 !important;"
 
 		const dims = el("span", "dk-badge-dims")
 		dims.style.cssText = "font-weight: 700 !important; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important; color: #ffffff !important; font-size: 13.5px !important; letter-spacing: 0.3px !important;"
 		dims.textContent = `${window.innerWidth} × ${window.innerHeight} px`
 
 		const tag = el("span", "dk-badge-tag")
-		tag.style.cssText = "background: rgba(59, 130, 246, 0.25) !important; border: 1px solid rgba(59, 130, 246, 0.5) !important; color: #93c5fd !important; border-radius: 9999px !important; padding: 2px 8px !important; font-size: 11px !important; font-weight: 600 !important; text-transform: uppercase !important; letter-spacing: 0.5px !important;"
+		tag.style.cssText = "background: rgba(255, 90, 31, 0.25) !important; border: 1px solid rgba(255, 90, 31, 0.5) !important; color: #ffb08a !important; border-radius: 12px !important; padding: 2px 8px !important; font-size: 11px !important; font-weight: 600 !important; text-transform: uppercase !important; letter-spacing: 0.5px !important;"
 		tag.textContent = bucket(window.innerWidth)
 
 		const dpr = el("span", "dk-badge-dpr")
-		dpr.style.cssText = "color: #94a3b8 !important; font-size: 12px !important; border-left: 1px solid rgba(255, 255, 255, 0.2) !important; padding-left: 8px !important;"
+		dpr.style.cssText = "color: #b3a894 !important; font-size: 12px !important; border-left: 1px solid rgba(243, 236, 224, 0.2) !important; padding-left: 8px !important;"
 		dpr.textContent = `DPR ${window.devicePixelRatio}`
 
 		const closeBtn = el("button", "dk-badge-close")
 		closeBtn.type = "button"
-		closeBtn.textContent = "✕"
-		closeBtn.title = "Close Viewport Badge"
-		closeBtn.style.cssText = "background: rgba(239, 68, 68, 0.2) !important; border: 1px solid rgba(239, 68, 68, 0.4) !important; border-radius: 9999px !important; color: #fca5a5 !important; cursor: pointer !important; font-size: 11px !important; font-weight: 700 !important; padding: 3px 8px !important; line-height: 1 !important; margin-left: 6px !important; display: inline-flex !important; align-items: center !important;"
+		closeBtn.appendChild(icon("close", 12))
+		closeBtn.title = "Close viewport badge"
+		closeBtn.style.cssText = "background: rgba(255, 77, 77, 0.2) !important; border: 1px solid rgba(255, 77, 77, 0.4) !important; border-radius: 12px !important; color: #ffb3a3 !important; cursor: pointer !important; font-size: 11px !important; font-weight: 700 !important; padding: 3px 8px !important; line-height: 1 !important; margin-left: 6px !important; display: inline-flex !important; align-items: center !important;"
 		closeBtn.addEventListener("click", (e) => {
 			e.stopPropagation()
 			toggleViewport()
@@ -2636,12 +2811,20 @@
 	}
 
 	const SIMULATOR_PRESETS = [
-		{ label: "iPhone SE", icon: "📱", w: 375, h: 667 },
-		{ label: "iPhone 14", icon: "📱", w: 390, h: 844 },
-		{ label: "iPad Mini", icon: "📱", w: 768, h: 1024 },
-		{ label: "MacBook 13", icon: "💻", w: 1280, h: 800 },
-		{ label: "Full HD", icon: "🖥️", w: 1920, h: 1080 },
+		{ label: "iPhone SE", icon: "phone", w: 375, h: 667 },
+		{ label: "iPhone 14", icon: "phone", w: 390, h: 844 },
+		{ label: "iPad Mini", icon: "phone", w: 768, h: 1024 },
+		{ label: "MacBook 13", icon: "laptop", w: 1280, h: 800 },
+		{ label: "Full HD", icon: "monitor", w: 1920, h: 1080 },
 	]
+
+	let deviceEscHandler = null
+
+	function setDeviceTitle(target, label, width) {
+		target.textContent = ""
+		target.appendChild(icon(width <= 820 ? "phone" : width <= 1440 ? "laptop" : "monitor", 14))
+		target.appendChild(document.createTextNode(label))
+	}
 
 	function toggleDeviceFrame(payload) {
 		if (payload?.close === true || (deviceSimulator && !payload)) {
@@ -2650,6 +2833,8 @@
 			}
 			deviceSimulator = null
 			state.deviceFrame = null
+			if (deviceEscHandler) window.removeEventListener("keydown", deviceEscHandler)
+			deviceEscHandler = null
 			if (badge) badge.style.display = ""
 			hideFloatingCta()
 			try {
@@ -2664,7 +2849,7 @@
 		let curW = Math.max(280, Math.round(Number(payload?.width) || 375))
 		let curH = Math.max(200, Math.round(Number(payload?.height) || 667))
 		let curLabel = payload?.label || "Mobile"
-		let curIcon = payload?.icon || "📱"
+		let curIcon = typeof payload?.icon === "string" && ICONS[payload.icon] ? payload.icon : "phone"
 		let isLandscape = false
 
 		if (badge) badge.style.display = "none"
@@ -2681,7 +2866,7 @@
 				const homeBar = shell.querySelector(".dk-sim-home-bar")
 				if (notch) notch.style.display = curW <= 480 ? "block" : "none"
 				if (homeBar) homeBar.style.display = curW <= 480 ? "block" : "none"
-				titleText.textContent = `${curIcon} ${curLabel}`
+				setDeviceTitle(titleText, curLabel, curW)
 				dimBadge.textContent = `${curW} × ${curH} px`
 				state.deviceFrame = { active: true, width: curW, height: curH, label: curLabel, icon: curIcon, isLandscape: false }
 				showFloatingCta(
@@ -2705,26 +2890,26 @@
 		root.querySelectorAll(".dk-device-sim-overlay").forEach((el) => el.remove())
 
 		const overlay = el("div", "dk-device-sim-overlay")
-		overlay.style.cssText = "position: fixed !important; inset: 0 !important; z-index: 2147483645 !important; background: radial-gradient(circle at 50% 25%, #1e293b 0%, #0b1120 100%) !important; background-image: radial-gradient(rgba(255, 255, 255, 0.08) 1.5px, transparent 1.5px) !important; background-size: 24px 24px !important; overflow: auto !important; padding: 16px 20px 60px 20px !important; pointer-events: auto !important; box-sizing: border-box !important;"
+		overlay.style.cssText = "position: fixed !important; inset: 0 !important; z-index: 2147483645 !important; background: radial-gradient(circle at 50% 25%, #221e18 0%, #17140f 100%) !important; background-image: radial-gradient(rgba(243, 236, 224, 0.08) 1.5px, transparent 1.5px) !important; background-size: 24px 24px !important; overflow: auto !important; padding: 16px 20px 60px 20px !important; pointer-events: auto !important; box-sizing: border-box !important;"
 
 		const inner = el("div", "dk-sim-inner")
 		inner.style.cssText = "display: flex !important; flex-direction: column !important; align-items: center !important; min-width: 100% !important; width: max-content !important; margin: 0 auto !important; box-sizing: border-box !important;"
 
 		const toolbar = el("div", "dk-sim-toolbar")
-		toolbar.style.cssText = "position: sticky !important; top: 0 !important; z-index: 30 !important; display: inline-flex !important; align-items: center !important; gap: 10px !important; background: rgba(15, 23, 42, 0.92) !important; backdrop-filter: blur(16px) !important; -webkit-backdrop-filter: blur(16px) !important; border: 1.5px solid rgba(59, 130, 246, 0.5) !important; border-radius: 9999px !important; padding: 6px 14px !important; box-shadow: 0 12px 30px rgba(0, 0, 0, 0.7), 0 0 20px rgba(59, 130, 246, 0.3) !important; margin-bottom: 20px !important; flex-wrap: wrap !important; justify-content: center !important;"
+		toolbar.style.cssText = "position: sticky !important; top: 0 !important; z-index: 30 !important; display: inline-flex !important; align-items: center !important; gap: 10px !important; background: rgba(23, 20, 15, 0.92) !important; backdrop-filter: blur(16px) !important; -webkit-backdrop-filter: blur(16px) !important; border: 1.5px solid rgba(255, 90, 31, 0.5) !important; border-radius: 12px !important; padding: 6px 14px !important; box-shadow: 0 12px 30px rgba(0, 0, 0, 0.7), 0 0 20px rgba(255, 90, 31, 0.3) !important; margin-bottom: 20px !important; flex-wrap: wrap !important; justify-content: center !important;"
 
 		const titleText = el("span", "dk-sim-title")
 		titleText.style.cssText = "font-weight: 700 !important; color: #ffffff !important; font-size: 13px !important; display: inline-flex !important; align-items: center !important; gap: 6px !important;"
-		titleText.textContent = `${curIcon} ${curLabel}`
+		setDeviceTitle(titleText, curLabel, curW)
 
 		const dimBadge = el("span", "dk-sim-dim-badge")
-		dimBadge.style.cssText = "font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important; font-size: 11.5px !important; font-weight: 600 !important; color: #93c5fd !important; background: rgba(59, 130, 246, 0.25) !important; border: 1px solid rgba(59, 130, 246, 0.4) !important; padding: 2px 8px !important; border-radius: 9999px !important;"
+		dimBadge.style.cssText = "font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important; font-size: 11.5px !important; font-weight: 600 !important; color: #ffb08a !important; background: rgba(255, 90, 31, 0.25) !important; border: 1px solid rgba(255, 90, 31, 0.4) !important; padding: 2px 8px !important; border-radius: 12px !important;"
 		dimBadge.textContent = `${curW} × ${curH} px`
 
 		const rotateBtn = el("button", "dk-sim-btn")
 		rotateBtn.type = "button"
-		rotateBtn.style.cssText = "background: rgba(255, 255, 255, 0.1) !important; border: 1px solid rgba(255, 255, 255, 0.2) !important; border-radius: 9999px !important; color: #ffffff !important; cursor: pointer !important; font-size: 11.5px !important; font-weight: 600 !important; padding: 3px 10px !important; display: inline-flex !important; align-items: center !important; gap: 4px !important; transition: all 0.15s !important;"
-		rotateBtn.textContent = "🔄 Rotate"
+		rotateBtn.style.cssText = "background: rgba(243, 236, 224, 0.1) !important; border: 1px solid rgba(243, 236, 224, 0.2) !important; border-radius: 12px !important; color: #ffffff !important; cursor: pointer !important; font-size: 11.5px !important; font-weight: 600 !important; padding: 3px 10px !important; display: inline-flex !important; align-items: center !important; gap: 4px !important; transition: all 0.15s !important;"
+		setButtonContent(rotateBtn, "rotate", "Rotate")
 		rotateBtn.title = "Toggle Portrait / Landscape orientation"
 		rotateBtn.addEventListener("click", () => {
 			isLandscape = !isLandscape
@@ -2744,12 +2929,12 @@
 		})
 
 		const presetGroup = el("div", "dk-sim-presets")
-		presetGroup.style.cssText = "display: inline-flex !important; align-items: center !important; gap: 4px !important; border-left: 1px solid rgba(255, 255, 255, 0.2) !important; padding-left: 8px !important;"
+		presetGroup.style.cssText = "display: inline-flex !important; align-items: center !important; gap: 4px !important; border-left: 1px solid rgba(243, 236, 224, 0.2) !important; padding-left: 8px !important;"
 
 		for (const p of SIMULATOR_PRESETS) {
 			const pBtn = el("button", "dk-sim-preset-btn")
 			pBtn.type = "button"
-			pBtn.style.cssText = "background: rgba(255, 255, 255, 0.08) !important; border: 1px solid rgba(255, 255, 255, 0.15) !important; border-radius: 9999px !important; color: #cbd5e1 !important; cursor: pointer !important; font-size: 10.5px !important; font-weight: 500 !important; padding: 2px 7px !important; transition: all 0.15s !important;"
+			pBtn.style.cssText = "background: rgba(243, 236, 224, 0.08) !important; border: 1px solid rgba(243, 236, 224, 0.15) !important; border-radius: 12px !important; color: #d6ccbb !important; cursor: pointer !important; font-size: 10.5px !important; font-weight: 500 !important; padding: 2px 7px !important; transition: all 0.15s !important;"
 			pBtn.textContent = p.label
 			pBtn.addEventListener("click", () => {
 				curW = p.w
@@ -2764,7 +2949,7 @@
 				const homeBar = shell.querySelector(".dk-sim-home-bar")
 				if (notch) notch.style.display = curW <= 480 ? "block" : "none"
 				if (homeBar) homeBar.style.display = curW <= 480 ? "block" : "none"
-				titleText.textContent = `${curIcon} ${curLabel}`
+				setDeviceTitle(titleText, curLabel, curW)
 				dimBadge.textContent = `${curW} × ${curH} px`
 				state.deviceFrame = { active: true, width: curW, height: curH, label: curLabel, icon: curIcon, isLandscape: false }
 				showFloatingCta(
@@ -2784,8 +2969,8 @@
 
 		const reloadBtn = el("button", "dk-sim-btn")
 		reloadBtn.type = "button"
-		reloadBtn.style.cssText = "background: rgba(255, 255, 255, 0.1) !important; border: 1px solid rgba(255, 255, 255, 0.2) !important; border-radius: 9999px !important; color: #ffffff !important; cursor: pointer !important; font-size: 11.5px !important; font-weight: 600 !important; padding: 3px 10px !important; display: inline-flex !important; align-items: center !important; gap: 4px !important;"
-		reloadBtn.textContent = "⟳ Reload"
+		reloadBtn.style.cssText = "background: rgba(243, 236, 224, 0.1) !important; border: 1px solid rgba(243, 236, 224, 0.2) !important; border-radius: 12px !important; color: #ffffff !important; cursor: pointer !important; font-size: 11.5px !important; font-weight: 600 !important; padding: 3px 10px !important; display: inline-flex !important; align-items: center !important; gap: 4px !important;"
+		setButtonContent(reloadBtn, "reset", "Reload")
 		reloadBtn.title = "Reload frame content"
 		reloadBtn.addEventListener("click", () => {
 			if (iframe) iframe.src = iframe.src
@@ -2793,22 +2978,22 @@
 
 		const exitBtn = el("button", "dk-sim-exit")
 		exitBtn.type = "button"
-		exitBtn.style.cssText = "background: rgba(239, 68, 68, 0.25) !important; border: 1px solid rgba(239, 68, 68, 0.5) !important; border-radius: 9999px !important; color: #fca5a5 !important; cursor: pointer !important; font-size: 11.5px !important; font-weight: 700 !important; padding: 3px 12px !important; display: inline-flex !important; align-items: center !important; gap: 4px !important; transition: all 0.15s !important;"
-		exitBtn.textContent = "✕ Exit Frame"
+		exitBtn.style.cssText = "background: rgba(255, 77, 77, 0.25) !important; border: 1px solid rgba(255, 77, 77, 0.5) !important; border-radius: 12px !important; color: #ffb3a3 !important; cursor: pointer !important; font-size: 11.5px !important; font-weight: 700 !important; padding: 3px 12px !important; display: inline-flex !important; align-items: center !important; gap: 4px !important; transition: all 0.15s !important;"
+		setButtonContent(exitBtn, "close", "Exit frame")
 		exitBtn.addEventListener("click", () => toggleDeviceFrame({ close: true }))
 
 		toolbar.append(titleText, dimBadge, rotateBtn, presetGroup, reloadBtn, exitBtn)
 		inner.appendChild(toolbar)
 
 		const shell = el("div", "dk-sim-shell")
-		shell.style.cssText = `width: ${curW}px !important; height: ${curH}px !important; transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1), height 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important; border: 12px solid #1e293b !important; outline: 2px solid rgba(148, 163, 184, 0.25) !important; border-radius: ${curW <= 480 ? "40px" : "24px"} !important; box-shadow: 0 25px 60px -15px rgba(0, 0, 0, 0.9), 0 0 40px rgba(59, 130, 246, 0.25) !important; background: #ffffff !important; overflow: hidden !important; position: relative !important; flex-shrink: 0 !important;`
+		shell.style.cssText = `width: ${curW}px !important; height: ${curH}px !important; transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1), height 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important; border: 12px solid #221e18 !important; outline: 2px solid rgba(179, 168, 148, 0.25) !important; border-radius: ${curW <= 480 ? "40px" : "24px"} !important; box-shadow: 0 25px 60px -15px rgba(0, 0, 0, 0.9), 0 0 40px rgba(255, 90, 31, 0.25) !important; background: #ffffff !important; overflow: hidden !important; position: relative !important; flex-shrink: 0 !important;`
 
 		const notch = el("div", "dk-sim-notch")
-		notch.style.cssText = `position: absolute !important; top: 8px !important; left: 50% !important; transform: translateX(-50%) !important; width: 90px !important; height: 18px !important; background: #0b1120 !important; border-radius: 9999px !important; z-index: 10 !important; pointer-events: none !important; display: ${curW <= 480 ? "block" : "none"} !important;`
+		notch.style.cssText = `position: absolute !important; top: 8px !important; left: 50% !important; transform: translateX(-50%) !important; width: 90px !important; height: 18px !important; background: #17140f !important; border-radius: 12px !important; z-index: 10 !important; pointer-events: none !important; display: ${curW <= 480 ? "block" : "none"} !important;`
 		shell.appendChild(notch)
 
 		const homeBar = el("div", "dk-sim-home-bar")
-		homeBar.style.cssText = `position: absolute !important; bottom: 6px !important; left: 50% !important; transform: translateX(-50%) !important; width: 120px !important; height: 4px !important; background: rgba(0, 0, 0, 0.3) !important; border-radius: 9999px !important; z-index: 10 !important; pointer-events: none !important; display: ${curW <= 480 ? "block" : "none"} !important;`
+		homeBar.style.cssText = `position: absolute !important; bottom: 6px !important; left: 50% !important; transform: translateX(-50%) !important; width: 120px !important; height: 4px !important; background: rgba(0, 0, 0, 0.3) !important; border-radius: 12px !important; z-index: 10 !important; pointer-events: none !important; display: ${curW <= 480 ? "block" : "none"} !important;`
 		shell.appendChild(homeBar)
 
 		const iframe = document.createElement("iframe")
@@ -2820,17 +3005,15 @@
 		inner.appendChild(shell)
 
 		const tip = el("div", "dk-sim-tip")
-		tip.style.cssText = "color: #94a3b8 !important; font-size: 11.5px !important; margin-top: 14px !important; text-align: center !important;"
-		tip.textContent = "💡 Tip: Press Esc to exit frame · Scroll inside the device to test responsive layouts"
+		tip.style.cssText = "color: #b3a894 !important; font-size: 11.5px !important; margin-top: 14px !important; text-align: center !important;"
+		tip.textContent = "Press Esc to exit the frame · Scroll inside the device to test responsive layouts"
 		inner.appendChild(tip)
 
-		const onEsc = (e) => {
-			if (e.key === "Escape") {
-				window.removeEventListener("keydown", onEsc)
-				toggleDeviceFrame({ close: true })
-			}
+		if (deviceEscHandler) window.removeEventListener("keydown", deviceEscHandler)
+		deviceEscHandler = (e) => {
+			if (e.key === "Escape") toggleDeviceFrame({ close: true })
 		}
-		window.addEventListener("keydown", onEsc)
+		window.addEventListener("keydown", deviceEscHandler)
 
 		overlay.appendChild(inner)
 		root.appendChild(overlay)
@@ -2853,51 +3036,115 @@
 		return { active: true, width: curW, height: curH, label: curLabel }
 	}
 
+	function accessibleName(node) {
+		const aria = node.getAttribute("aria-label")
+		if (aria && aria.trim()) return aria.trim()
+		const ids = node.getAttribute("aria-labelledby")
+		if (ids) {
+			const text = ids.split(/\s+/).map((id) => document.getElementById(id)?.textContent ?? "").join(" ").trim()
+			if (text) return text
+		}
+		const text = (node.textContent || "").trim()
+		if (text) return text
+		const title = node.getAttribute("title")
+		if (title && title.trim()) return title.trim()
+		if (node.tagName === "INPUT") return node.value || node.getAttribute("alt") || ""
+		const inner = node.querySelector("img[alt]:not([alt='']), [aria-label], svg title")
+		if (inner) return inner.getAttribute("alt") || inner.getAttribute("aria-label") || inner.textContent || ""
+		return ""
+	}
+
+	// Returns the first opaque background color behind a node, or null when an image or gradient
+	// is in the way and the contrast cannot be computed reliably.
+	function opaqueBackground(node) {
+		let current = node
+		while (current && current.nodeType === 1) {
+			const style = getComputedStyle(current)
+			if (style.backgroundImage && style.backgroundImage !== "none") return null
+			const bg = style.backgroundColor
+			if (bg && !/rgba\(0,\s*0,\s*0,\s*0\)|transparent/.test(bg)) return bg
+			current = current.parentElement
+		}
+		return "rgb(255, 255, 255)"
+	}
+
 	function auditA11y() {
 		const issues = []
+		let truncated = false
 		const add = (severity, rule, message, node) =>
 			issues.push({ severity, rule, message, selector: node ? cssPath(node) : undefined })
-
-		for (const img of document.images) {
-			if (!img.hasAttribute("alt")) add("serious", "image-alt", "Image missing alt attribute", img)
+		const track = (scan) => {
+			if (scan.truncated) truncated = true
 		}
-		for (const control of document.querySelectorAll("input:not([type=hidden]), select, textarea")) {
+		const opts = { limit: 3000, ms: 200 }
+		const hidden = (node) => Boolean(node.closest("[aria-hidden='true'], [hidden]"))
+
+		track(scanElements("img", (img) => {
+			if (img.hasAttribute("alt") || hidden(img)) return
+			if (img.getAttribute("role") === "presentation" || img.getAttribute("role") === "none") return
+			add("serious", "image-alt", "Image missing alt attribute", img)
+		}, opts))
+		track(scanElements("input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]), select, textarea", (control) => {
+			if (hidden(control) || !isRendered(control)) return
 			const labelled =
 				control.labels?.length ||
-				control.getAttribute("aria-label") ||
+				control.getAttribute("aria-label")?.trim() ||
 				control.getAttribute("aria-labelledby") ||
 				control.getAttribute("title")
-			if (!labelled) add("critical", "form-label", "Form control has no accessible name", control)
-		}
-		for (const button of document.querySelectorAll("button, [role=button], a")) {
-			const name = (button.textContent || "").trim() || button.getAttribute("aria-label") || button.querySelector("img[alt]")?.alt
-			if (!name) add("serious", "control-name", "Interactive control has no visible or ARIA name", button)
-		}
+			if (!labelled) {
+				add("critical", "form-label", control.placeholder ? "Form control relies on a placeholder instead of a label" : "Form control has no accessible name", control)
+			}
+		}, opts))
+		track(scanElements("button, [role=button], a[href], input[type=submit], input[type=button], input[type=image]", (control) => {
+			if (hidden(control)) return
+			if (!accessibleName(control) && isRendered(control)) add("serious", "control-name", "Interactive control has no visible or ARIA name", control)
+		}, opts))
+
 		let previous = 0
-		for (const heading of document.querySelectorAll("h1,h2,h3,h4,h5,h6")) {
+		track(scanElements("h1,h2,h3,h4,h5,h6", (heading) => {
 			const level = Number(heading.tagName[1])
-			if (previous && level - previous > 1) add("moderate", "heading-order", `Heading jumps h${previous} → h${level}`, heading)
+			if (previous && level - previous > 1) add("moderate", "heading-order", `Heading jumps h${previous} to h${level}`, heading)
+			if (!heading.textContent.trim()) add("moderate", "empty-heading", "Heading has no text", heading)
 			previous = level
-		}
+		}, opts))
 		if (document.querySelectorAll("h1").length !== 1) add("moderate", "page-has-h1", "Page should have exactly one h1")
 		if (!document.documentElement.lang) add("serious", "html-lang", "<html> is missing a lang attribute")
-		for (const node of [...document.querySelectorAll("p,span,a,li,button,h1,h2,h3")].slice(0, 400)) {
-			if (!node.textContent.trim()) continue
-			const style = getComputedStyle(node)
-			if (style.visibility === "hidden" || style.display === "none") continue
-			const ratio = contrast(style.color, effectiveBackground(node))
+
+		// Contrast is checked on elements that own visible text, found through text nodes.
+		const seen = new Set()
+		const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT)
+		const deadline = performance.now() + 300
+		let checked = 0
+		while (walker.nextNode() && checked < 600) {
+			const textNode = walker.currentNode
+			const parent = textNode.parentElement
+			if (!parent || seen.has(parent) || !textNode.data.trim()) continue
+			seen.add(parent)
+			if (/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|OPTION)$/.test(parent.tagName) || hidden(parent)) continue
+			checked++
+			if ((checked & 31) === 31 && performance.now() > deadline) {
+				truncated = true
+				break
+			}
+			const style = getComputedStyle(parent)
+			if (style.visibility === "hidden" || style.display === "none" || Number(style.opacity) === 0) continue
+			if (!isRendered(parent)) continue
+			const bg = opaqueBackground(parent)
+			if (!bg) continue
+			const ratio = contrast(style.color, bg)
 			const size = parseFloat(style.fontSize)
 			const large = size >= 24 || (size >= 18.66 && Number(style.fontWeight) >= 700)
 			if (ratio !== null && ratio < (large ? 3 : 4.5)) {
-				add("serious", "color-contrast", `Contrast ${ratio}:1 below WCAG AA`, node)
+				add("serious", "color-contrast", `Contrast ${ratio}:1 is below WCAG AA (${large ? "3" : "4.5"}:1)`, parent)
 			}
 		}
-		for (const node of document.querySelectorAll("[tabindex]")) {
+
+		track(scanElements("[tabindex]", (node) => {
 			if (Number(node.getAttribute("tabindex")) > 0) add("minor", "tabindex", "Positive tabindex breaks natural focus order", node)
-		}
-		enhancedA11yChecks(issues, add)
+		}, opts))
+		enhancedA11yChecks(issues, add, track)
 		const summary = issues.reduce((acc, issue) => ({ ...acc, [issue.severity]: (acc[issue.severity] ?? 0) + 1 }), {})
-		return { total: issues.length, summary, issues: issues.slice(0, 200) }
+		return { total: issues.length, summary, issues: issues.slice(0, 200), truncated }
 	}
 
 	function auditSeo() {
@@ -2920,7 +3167,7 @@
 		else if (description.length > 160) warnings.push(`Description is ${description.length} chars (aim for <= 160)`)
 
 		if (!canonical) warnings.push("Missing canonical link")
-		else if (canonical !== location.href.split("#")[0]) warnings.push("Canonical URL differs from current page URL")
+		else if (canonical.replace(/\/$/, "") !== location.href.split("#")[0].replace(/\/$/, "")) warnings.push("Canonical URL differs from current page URL")
 
 		if (robots && /noindex/i.test(robots)) warnings.push("Page has robots noindex directive (search engines will not index this page)")
 
@@ -2932,6 +3179,19 @@
 		const h1List = [...document.querySelectorAll("h1")].map((h) => (h.textContent || "").trim()).filter(Boolean)
 		if (h1List.length === 0) warnings.push("Page has no <h1> heading")
 		else if (h1List.length > 1) warnings.push(`Page has multiple (${h1List.length}) <h1> headings (recommended: exactly 1)`)
+
+		const outline = []
+		let lastLevel = 0
+		scanElements("h1,h2,h3,h4,h5,h6", (heading) => {
+			const level = Number(heading.tagName[1])
+			const entry = { level, text: (heading.textContent || "").trim().replace(/\s+/g, " ").slice(0, 120), selector: cssPath(heading) }
+			if (lastLevel && level - lastLevel > 1) entry.issue = `skips from h${lastLevel}`
+			if (!entry.text) entry.issue = "empty heading"
+			outline.push(entry)
+			lastLevel = level
+			if (outline.length >= 150) return false
+		}, { limit: 2000, ms: 100 })
+		if (outline.some((h) => h.issue?.startsWith("skips"))) warnings.push("Heading levels skip (for example h2 to h4), see the headings outline")
 
 		const images = [...document.images]
 		const favicon = document.querySelector("link[rel*='icon']")?.href || null
@@ -2963,6 +3223,7 @@
 			},
 			headings: {
 				h1: h1List.slice(0, 10),
+				outline,
 				counts: Object.fromEntries([1, 2, 3, 4, 5, 6].map((n) => [`h${n}`, document.querySelectorAll(`h${n}`).length])),
 			},
 			images: { total: images.length, missingAlt: images.filter((i) => !i.alt).length },
@@ -2972,59 +3233,92 @@
 		}
 	}
 
-	async function scanLinks() {
-		const links = [...document.querySelectorAll("a")]
+	async function scanLinks(payload = {}) {
+		const links = [...document.querySelectorAll("a")].slice(0, 5000)
 		const problems = []
-		const checkedUrls = new Set()
 		const brokenLinks = []
+		const redirects = []
+		const isHttps = location.protocol === "https:"
+		const textOf = (link) => (link.textContent || "").trim().replace(/\s+/g, " ").slice(0, 40)
 
 		for (const link of links) {
 			const href = link.getAttribute("href")
-			if (href === null || href.trim() === "" || href === "#") {
-				problems.push({ issue: "empty or hash href", selector: cssPath(link), text: (link.textContent || "").trim().slice(0, 40) })
-			} else if (href.startsWith("javascript:")) {
-				problems.push({ issue: "javascript: link", selector: cssPath(link) })
-			} else if (href.startsWith("#") && href.length > 1) {
-				const targetId = href.slice(1)
+			if (href === null) continue
+			const trimmed = href.trim()
+			if (trimmed === "" || trimmed === "#") {
+				problems.push({ issue: "empty or hash href", selector: cssPath(link), text: textOf(link) })
+			} else if (/^javascript:/i.test(trimmed)) {
+				problems.push({ issue: "javascript: link", selector: cssPath(link), text: textOf(link) })
+			} else if (trimmed.startsWith("#") && trimmed !== "#top") {
+				let targetId = trimmed.slice(1)
 				try {
-					if (!document.getElementById(targetId) && !document.querySelector(`[name="${targetId}"]`)) {
-						problems.push({ issue: `Broken in-page anchor (#${targetId})`, selector: cssPath(link), text: (link.textContent || "").trim().slice(0, 40) })
-					}
-				} catch {  }
-			} else if (location.protocol === "https:" && href.startsWith("http:")) {
+					targetId = decodeURIComponent(targetId)
+				} catch {}
+				if (!document.getElementById(targetId) && !document.getElementsByName(targetId).length) {
+					problems.push({ issue: `Broken in-page anchor (#${targetId})`, selector: cssPath(link), text: textOf(link) })
+				}
+			} else if (isHttps && /^http:/i.test(trimmed)) {
 				problems.push({ issue: "Mixed content link (HTTP on HTTPS)", href, selector: cssPath(link) })
 			}
-
-			if (link.target === "_blank" && !/noopener/.test(link.rel)) {
-				problems.push({ issue: "target=_blank without rel=noopener", selector: cssPath(link) })
+			// noreferrer implies noopener, and modern browsers default to noopener for _blank links.
+			if (link.target === "_blank" && !/noopener|noreferrer/i.test(link.rel)) {
+				problems.push({ issue: "target=_blank without rel=noopener (relies on browser default)", selector: cssPath(link) })
 			}
 		}
 
-		if (location.protocol === "https:") {
+		if (isHttps) {
 			for (const img of document.images) {
-				if (img.src && img.src.startsWith("http:")) {
-					problems.push({ issue: "Mixed content image (HTTP on HTTPS)", href: img.src, selector: cssPath(img) })
+				if (/^http:/i.test(img.currentSrc || img.src)) {
+					problems.push({ issue: "Mixed content image (HTTP on HTTPS)", href: img.currentSrc || img.src, selector: cssPath(img) })
 				}
 			}
-		}
-
-		const candidateLinks = links
-			.map((l) => l.href)
-			.filter((h) => h && h.startsWith(location.origin) && !checkedUrls.has(h))
-			.slice(0, 30)
-		for (const url of candidateLinks) {
-			checkedUrls.add(url)
-			try {
-				const res = await fetch(url, { method: "HEAD" }).catch(() => fetch(url, { method: "GET" }))
-				if (res && res.status >= 400) {
-					brokenLinks.push({ url, status: res.status, statusText: res.statusText })
-				}
-			} catch {  }
 		}
 
 		const brokenImages = [...document.images]
-			.filter((img) => img.complete && img.naturalWidth === 0)
+			.filter((img) => img.complete && img.naturalWidth === 0 && (img.currentSrc || img.src))
 			.map((img) => ({ src: img.currentSrc || img.src, selector: cssPath(img), alt: img.alt || null }))
+
+		const byUrl = new Map()
+		for (const link of links) {
+			const url = link.href
+			if (!/^https?:/i.test(url)) continue
+			const clean = url.split("#")[0]
+			if (!byUrl.has(clean)) byUrl.set(clean, link)
+		}
+		const sameOrigin = [...byUrl.keys()].filter((u) => u.startsWith(location.origin))
+		const external = [...byUrl.keys()].filter((u) => !u.startsWith(location.origin))
+
+		let httpChecked = false
+		let httpError = null
+		let checkedCount = 0
+		if (payload?.checkHttp === true || payload?.checkHttp === "true") {
+			// Same origin links first so the 300 URL cap keeps the most relevant ones.
+			const urls = [...sameOrigin, ...external].slice(0, 300)
+			const response = await sendRuntime({ type: "links:check", urls, pageUrl: location.href })
+			if (response?.ok && Array.isArray(response.results)) {
+				httpChecked = true
+				checkedCount = response.checked ?? response.results.length
+				for (const result of response.results) {
+					if (!result) continue
+					const link = byUrl.get(result.url)
+					const failed = (typeof result.status === "number" && result.status >= 400) || (result.ok === false && result.status === null)
+					if (failed) {
+						brokenLinks.push({
+							url: result.url,
+							status: result.status ?? 0,
+							statusText: result.statusText || result.error || "",
+							error: result.error,
+							selector: link ? cssPath(link) : undefined,
+							text: link ? textOf(link) : undefined,
+						})
+					} else if (result.redirected && redirects.length < 50) {
+						redirects.push({ url: result.url, finalUrl: result.finalUrl, status: result.status })
+					}
+				}
+			} else {
+				httpError = response?.error ?? "Link check unavailable"
+			}
+		}
 
 		return {
 			links: links.length,
@@ -3032,59 +3326,109 @@
 			brokenLinks,
 			brokenImages,
 			problems: problems.slice(0, 200),
+			httpChecked,
+			checkedCount,
+			httpError,
+			redirects,
+			uniqueUrls: byUrl.size,
+			sameOriginUrls: sameOrigin.length,
+			externalUrls: external.length,
 		}
 	}
 
-	function metrics() {
+	// LCP, layout shift, event and long task entries are only exposed through a buffered
+	// PerformanceObserver, never through getEntriesByType.
+	function observeBuffered(type, extra = {}) {
+		return new Promise((resolve) => {
+			try {
+				if (typeof PerformanceObserver === "undefined" || !PerformanceObserver.supportedEntryTypes?.includes(type)) {
+					resolve(null)
+					return
+				}
+				let entries = []
+				const observer = new PerformanceObserver((list) => {
+					entries = entries.concat(list.getEntries())
+				})
+				observer.observe({ type, buffered: true, ...extra })
+				setTimeout(() => {
+					try {
+						entries = entries.concat(observer.takeRecords())
+						observer.disconnect()
+					} catch {}
+					resolve(entries)
+				}, 50)
+			} catch {
+				resolve(null)
+			}
+		})
+	}
+
+	function clsFromShifts(shifts) {
+		let max = 0
+		let current = 0
+		let first = 0
+		let last = 0
+		for (const shift of shifts) {
+			if (shift.hadRecentInput) continue
+			if (current && (shift.startTime - last > 1000 || shift.startTime - first > 5000)) {
+				max = Math.max(max, current)
+				current = 0
+			}
+			if (!current) first = shift.startTime
+			current += shift.value
+			last = shift.startTime
+		}
+		return Math.round(Math.max(max, current) * 1000) / 1000
+	}
+
+	async function metrics() {
 		const nav = performance.getEntriesByType("navigation")[0]
 		const resources = performance.getEntriesByType("resource")
 		const bytes = resources.reduce((sum, r) => sum + (r.transferSize || 0), 0)
 		const paints = Object.fromEntries(performance.getEntriesByType("paint").map((p) => [p.name, Math.round(p.startTime)]))
 		const byType = {}
 		const bytesByType = {}
-
 		for (const resource of resources) {
 			const key = resource.initiatorType || "other"
 			byType[key] = (byType[key] ?? 0) + 1
 			bytesByType[key] = (bytesByType[key] ?? 0) + (resource.transferSize || 0)
 		}
 
-		let lcp = null
-		try {
-			const lcpEntries = performance.getEntriesByType("largest-contentful-paint")
-			if (lcpEntries.length) lcp = Math.round(lcpEntries[lcpEntries.length - 1].startTime)
-		} catch {  }
+		const [lcpEntries, shiftEntries, eventEntries, longTaskEntries] = await Promise.all([
+			observeBuffered("largest-contentful-paint"),
+			observeBuffered("layout-shift"),
+			observeBuffered("event", { durationThreshold: 40 }),
+			observeBuffered("longtask"),
+		])
 
-		let cls = null
-		try {
-			const layoutShifts = performance.getEntriesByType("layout-shift")
-			if (layoutShifts.length) {
-				cls = Math.round(layoutShifts.reduce((sum, e) => sum + (e.hadRecentInput ? 0 : e.value), 0) * 1000) / 1000
-			}
-		} catch {  }
-
-		let longTasks = null
-		try {
-			const lt = performance.getEntriesByType("longtask")
-			if (lt.length) longTasks = { count: lt.length, totalMs: Math.round(lt.reduce((s, t) => s + t.duration, 0)) }
-		} catch {  }
+		const lastLcp = lcpEntries?.length ? lcpEntries[lcpEntries.length - 1] : null
+		const lcp = lastLcp ? Math.round(lastLcp.renderTime || lastLcp.startTime) : null
+		const lcpElement = lastLcp?.element ? cssPath(lastLcp.element) : null
+		const cls = shiftEntries ? clsFromShifts(shiftEntries) : null
+		let inp = null
+		if (eventEntries?.length) {
+			const interactions = eventEntries.filter((e) => e.interactionId)
+			if (interactions.length) inp = Math.round(Math.max(...interactions.map((e) => e.duration)))
+		}
+		const longTasks = longTaskEntries?.length
+			? { count: longTaskEntries.length, totalMs: Math.round(longTaskEntries.reduce((s, t) => s + t.duration, 0)) }
+			: null
 
 		const ttfb = nav ? Math.round(nav.responseStart) : null
-		const fcp = paints["first-contentful-paint"] || null
-
+		const fcp = paints["first-contentful-paint"] ?? null
 		const rate = (val, good, poor) => {
 			if (val === null || val === undefined) return "unknown"
 			if (val <= good) return "good"
 			if (val <= poor) return "needs-improvement"
 			return "poor"
 		}
-
 		const vitals = {
 			ttfb: { value: ttfb, rating: rate(ttfb, 800, 1800), label: "TTFB", unit: "ms" },
 			fcp: { value: fcp, rating: rate(fcp, 1800, 3000), label: "FCP", unit: "ms" },
 			lcp: { value: lcp, rating: rate(lcp, 2500, 4000), label: "LCP", unit: "ms" },
 			cls: { value: cls, rating: rate(cls, 0.1, 0.25), label: "CLS", unit: "" },
 		}
+		if (inp !== null) vitals.inp = { value: inp, rating: rate(inp, 200, 500), label: "INP (approx.)", unit: "ms" }
 
 		const largest = [...resources]
 			.filter((r) => r.transferSize > 0)
@@ -3115,7 +3459,9 @@
 			loadMs: nav ? Math.round(nav.loadEventEnd) : null,
 			paints,
 			lcpMs: lcp,
+			lcpElement,
 			cls,
+			inpMs: inp,
 			vitals,
 			longTasks,
 			memory,
@@ -3167,51 +3513,58 @@
 		})
 		const totalCookieBytes = cookieItems.reduce((acc, c) => acc + c.bytes, 0)
 
+		const store = (name) => {
+			try {
+				return window[name]
+			} catch {
+				return null
+			}
+		}
 		return {
-			localStorage: read(window.localStorage),
-			sessionStorage: read(window.sessionStorage),
+			localStorage: read(store("localStorage")),
+			sessionStorage: read(store("sessionStorage")),
 			cookies: { items: cookieItems, raw: cookieStrings, totalBytes: totalCookieBytes },
 		}
 	}
 
 	function fontsReport() {
 		const seen = new Map()
-		for (const node of [...document.querySelectorAll("body *")].slice(0, 3000)) {
-			const text = node.textContent?.trim()
-			if (!text) continue
+		scanElements("body *", (node) => {
+			// Only elements that own text actually render it with their font.
+			if (!hasOwnText(node)) return
 			const style = getComputedStyle(node)
+			if (style.display === "none") return
 			const primaryFamily = style.fontFamily.split(",")[0].replace(/["']/g, "").trim()
 			const fullFamily = style.fontFamily.replace(/["']/g, "").trim()
-			const fontSize = style.fontSize
-			const fontWeight = style.fontWeight
-			const lineHeight = style.lineHeight === "normal" ? "1.5" : style.lineHeight
-			const key = `${primaryFamily} | ${fontSize} | ${fontWeight} | ${lineHeight}`
-
-			if (!seen.has(key)) {
-				const sample = text.length > 35 ? text.slice(0, 35) + "…" : text
-				seen.set(key, {
+			const lineHeight = style.lineHeight === "normal" ? "normal" : style.lineHeight
+			const key = `${primaryFamily} | ${style.fontSize} | ${style.fontWeight} | ${lineHeight}`
+			let entry = seen.get(key)
+			if (!entry) {
+				const text = (node.textContent || "").trim().replace(/\s+/g, " ")
+				entry = {
 					style: key,
 					family: primaryFamily,
 					fullFamily,
-					size: fontSize,
-					weight: fontWeight,
+					size: style.fontSize,
+					weight: style.fontWeight,
 					lineHeight,
-					sampleText: sample,
+					sampleText: text.length > 35 ? `${text.slice(0, 35)}…` : text,
 					count: 0,
-				})
+				}
+				seen.set(key, entry)
 			}
-			const entry = seen.get(key)
 			entry.count++
-		}
-		return [...seen.values()]
-			.sort((a, b) => b.count - a.count)
-			.slice(0, 40)
+		}, { limit: 6000, ms: 300 })
+		return [...seen.values()].sort((a, b) => b.count - a.count).slice(0, 40)
 	}
 
 	let colorCanvasCtx = null
+	const colorCache = new Map()
 	function normalizeCssColor(colorStr) {
 		if (!colorStr || colorStr === "transparent" || colorStr === "inherit" || colorStr === "initial" || colorStr === "currentColor") return null
 		if (/rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/.test(colorStr)) return null
+		if (colorCache.has(colorStr)) return colorCache.get(colorStr)
+		let result
 		try {
 			if (!colorCanvasCtx) {
 				const canvas = document.createElement("canvas")
@@ -3223,31 +3576,39 @@
 			colorCanvasCtx.fillStyle = colorStr
 			colorCanvasCtx.fillRect(0, 0, 1, 1)
 			const [r, g, b, a] = colorCanvasCtx.getImageData(0, 0, 1, 1).data
-			if (a === 0 && !colorStr.toLowerCase().includes("black")) return null
-			const hex = `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`
-			const rgb = a < 255 ? `rgba(${r}, ${g}, ${b}, ${Number((a / 255).toFixed(2))})` : `rgb(${r}, ${g}, ${b})`
-			return { hex, rgb, raw: colorStr, alpha: a / 255 }
+			if (a === 0) {
+				result = null
+			} else {
+				const hex = `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`
+				const rgb = a < 255 ? `rgba(${r}, ${g}, ${b}, ${Number((a / 255).toFixed(2))})` : `rgb(${r}, ${g}, ${b})`
+				result = { hex, rgb, raw: colorStr, alpha: a / 255 }
+			}
 		} catch {
-			const fallbackHex = toHex(colorStr)
-			return { hex: fallbackHex, rgb: colorStr, raw: colorStr, alpha: 1 }
+			result = { hex: toHex(colorStr), rgb: colorStr, raw: colorStr, alpha: 1 }
 		}
+		if (colorCache.size < 2000) colorCache.set(colorStr, result)
+		return result
 	}
 
 	function colorReport() {
 		const seen = new Map()
-		for (const node of [...document.querySelectorAll("body *")].slice(0, 3000)) {
+		scanElements("body *", (node) => {
 			const style = getComputedStyle(node)
-			for (const value of [style.color, style.backgroundColor, style.borderTopColor, style.outlineColor]) {
-				if (!value || /rgba\(0,\s*0,\s*0,\s*0\)/.test(value)) continue
+			const values = [style.color, style.backgroundColor]
+			if (style.borderTopStyle !== "none" && style.borderTopWidth !== "0px") values.push(style.borderTopColor)
+			if (style.outlineStyle !== "none") values.push(style.outlineColor)
+			for (const value of values) {
 				const norm = normalizeCssColor(value)
 				if (!norm) continue
 				const key = norm.hex.toLowerCase()
-				if (!seen.has(key)) {
-					seen.set(key, { hex: key, rgb: norm.rgb, raw: norm.raw, count: 0 })
+				let entry = seen.get(key)
+				if (!entry) {
+					entry = { hex: key, rgb: norm.rgb, raw: norm.raw, count: 0 }
+					seen.set(key, entry)
 				}
-				seen.get(key).count++
+				entry.count++
 			}
-		}
+		}, { limit: 6000, ms: 300 })
 		return [...seen.values()].sort((a, b) => b.count - a.count).slice(0, 36)
 	}
 
@@ -3261,22 +3622,30 @@
 		document.addEventListener("mousemove", onEyedropperMove, true)
 		document.addEventListener("click", onEyedropperClick, true)
 		document.addEventListener("keydown", onEyedropperKeyDown, true)
+		const pixelAction = typeof window.EyeDropper === "function"
+			? [{ icon: "pipette", label: "Pick a pixel", title: "Use the browser eyedropper to sample any pixel", action: () => pickScreenPixel() }]
+			: null
 		showFloatingCta(
 			"Sidekick: Color Eyedropper",
-			"Hover any element to preview color • Click to sample and copy HEX • Esc to cancel",
-			() => stopInPageEyedropper()
+			"Hover any element to preview its color · Click to copy HEX · Esc to cancel",
+			() => stopInPageEyedropper(),
+			pixelAction,
 		)
+		registerCleanup("eyedropper", () => stopInPageEyedropper())
 		return { ok: true, data: { status: "active", message: "Color eyedropper active on page. Hover any element to preview color, click to sample & copy." } }
 	}
 
 	function stopInPageEyedropper() {
 		if (!eyedropperActive && !eyedropperBadge) return
 		eyedropperActive = false
+		activeCleanups.delete("eyedropper")
+		renderEyedropper.cancel()
 		document.removeEventListener("mousemove", onEyedropperMove, true)
 		document.removeEventListener("click", onEyedropperClick, true)
 		document.removeEventListener("keydown", onEyedropperKeyDown, true)
 		if (eyedropperBadge?.parentNode) eyedropperBadge.parentNode.removeChild(eyedropperBadge)
 		eyedropperBadge = null
+		lastEyedropperNode = null
 		if (highlight?.parentNode) highlight.style.display = "none"
 		hideFloatingCta()
 	}
@@ -3293,61 +3662,56 @@
 			if (eyedropperBadge) eyedropperBadge.style.display = "none"
 			return
 		}
-		const node = event.target
-		if (!(node instanceof Element)) return
+		if (event.target instanceof Element) renderEyedropper(event.target, event.clientX, event.clientY)
+	}
 
-		const style = getComputedStyle(node)
-		const bg = effectiveBackground(node)
-		const hasBg = bg && bg !== "transparent" && !/rgba\(0,\s*0,\s*0,\s*0\)/.test(bg)
-		const sampleColor = hasBg ? bg : style.color
-		const hex = toHex(sampleColor)
+	async function pickScreenPixel() {
+		try {
+			// The click on our own button is the user activation EyeDropper.open() requires.
+			const result = await new window.EyeDropper().open()
+			const hex = String(result?.sRGBHex ?? "").toLowerCase()
+			if (!hex) return
+			copy(hex)
+			stopInPageEyedropper()
+			showFloatingCta("Sidekick: Eyedropper", `Sampled pixel ${hex}, copied to clipboard`, () => hideFloatingCta())
+			showHud("Pixel sample", `HEX: ${hex}\n\nCopied to clipboard.`)
+		} catch {}
+	}
 
+	let lastEyedropperNode = null
+	const renderEyedropper = rafThrottle((node, clientX, clientY) => {
+		if (!eyedropperActive || !node.isConnected) return
+		const root = getShadowRoot()
 		if (!eyedropperBadge) {
-			eyedropperBadge = el("div", "dk-eyedropper-badge dk-root")
-			eyedropperBadge.style.cssText = "position: fixed !important; z-index: 2147483647 !important; pointer-events: none !important; display: flex !important; align-items: center !important; gap: 8px !important; background: rgba(15, 23, 42, 0.95) !important; color: #f8fafc !important; padding: 5px 10px !important; border-radius: 8px !important; border: 1px solid rgba(255,255,255,0.2) !important; font-size: 11px !important; font-family: ui-monospace, monospace !important; font-weight: 700 !important; box-shadow: 0 10px 25px rgba(0,0,0,0.5) !important; transform: translate(16px, 16px) !important; transition: transform 0.05s ease-out !important;"
+			eyedropperBadge = el("div", "dk-eyedropper-badge")
+			eyedropperBadge.style.cssText = "position: fixed !important; z-index: 2147483647 !important; pointer-events: none !important; display: flex !important; align-items: center !important; gap: 8px !important; background: #17140f !important; color: #f3ece0 !important; padding: 5px 10px !important; border-radius: 10px !important; border: 1px solid rgba(243,236,224,0.22) !important; font-size: 11px !important; font-family: ui-monospace, monospace !important; font-weight: 700 !important; box-shadow: 0 10px 25px rgba(0,0,0,0.5) !important; transform: translate(16px, 16px) !important;"
 			const swatchDot = el("span", "dk-eyedropper-dot")
-			swatchDot.style.cssText = "width: 14px !important; height: 14px !important; border-radius: 4px !important; border: 1px solid rgba(255,255,255,0.4) !important; flex-shrink: 0 !important;"
+			swatchDot.style.cssText = "width: 14px !important; height: 14px !important; border-radius: 6px !important; border: 1px solid rgba(243,236,224,0.4) !important; flex-shrink: 0 !important;"
 			const hexText = el("span", "dk-eyedropper-text")
 			eyedropperBadge.append(swatchDot, hexText)
-			getShadowRoot().appendChild(eyedropperBadge)
+			root.appendChild(eyedropperBadge)
 		}
-
-		eyedropperBadge.style.display = "flex"
-		eyedropperBadge.style.top = `${event.clientY}px`
-		eyedropperBadge.style.left = `${event.clientX}px`
-		const dot = eyedropperBadge.querySelector(".dk-eyedropper-dot")
-		const txt = eyedropperBadge.querySelector(".dk-eyedropper-text")
-		if (dot) dot.style.background = hex
-		if (txt) txt.textContent = hex
-
-		ensureStyles()
 		const rect = node.getBoundingClientRect()
-		if (!highlight) {
-			highlight = el("div", "dk-highlight")
-			getShadowRoot().appendChild(highlight)
+		if (node !== lastEyedropperNode) {
+			lastEyedropperNode = node
+			const bg = effectiveBackground(node)
+			const hasBg = bg && bg !== "transparent" && !/rgba\(0,\s*0,\s*0,\s*0\)/.test(bg)
+			const hex = toHex(hasBg ? bg : getComputedStyle(node).color)
+			eyedropperBadge.querySelector(".dk-eyedropper-dot").style.background = hex
+			eyedropperBadge.querySelector(".dk-eyedropper-text").textContent = hex
 		}
-		highlight.style.cssText = `
-			position: fixed !important;
-			z-index: 2147483645 !important;
-			pointer-events: none !important;
-			border: 2px solid #3b82f6 !important;
-			background: rgba(59, 130, 246, 0.08) !important;
-			border-radius: 3px !important;
-			top: ${Math.round(rect.top)}px !important;
-			left: ${Math.round(rect.left)}px !important;
-			width: ${Math.max(2, Math.round(rect.width))}px !important;
-			height: ${Math.max(2, Math.round(rect.height))}px !important;
-			display: block !important;
-			box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7), 0 0 16px rgba(59, 130, 246, 0.35) !important;
-		`
-	}
+		eyedropperBadge.style.display = "flex"
+		eyedropperBadge.style.top = `${clientY}px`
+		eyedropperBadge.style.left = `${clientX}px`
+		placeHighlight(rect)
+	})
 
 	function onEyedropperClick(event) {
 		if (!eyedropperActive) return
 		if (isDevKitEvent(event)) return
 		const node = event.target
 		if (!(node instanceof Element)) return
-		if (node === shadowHost || node.id === "devkit-shadow-host" || node.closest?.(".dk-root, #devkit-shadow-host")) return
+		if (isDevKitNode(node)) return
 
 		event.preventDefault()
 		event.stopPropagation()
@@ -3381,7 +3745,6 @@
 			() => copy(rgb)
 		)
 
-		window.__devkitEyedropperResult = { hex, rgb, copied: true }
 	}
 
 	function openEyeDropper() {
@@ -3389,18 +3752,24 @@
 	}
 
 	function zIndexScan() {
-		return [...document.querySelectorAll("body *")]
-			.map((node) => {
-				const style = getComputedStyle(node)
-				return { node, z: parseInt(style.zIndex, 10), position: style.position }
-			})
-			.filter((item) => Number.isFinite(item.z))
+		const items = []
+		scanElements("body *", (node) => {
+			const style = getComputedStyle(node)
+			const z = parseInt(style.zIndex, 10)
+			if (Number.isFinite(z)) items.push({ node, z, position: style.position })
+		}, { limit: 10000, ms: 300 })
+		return items
 			.sort((a, b) => b.z - a.z)
 			.slice(0, 25)
 			.map((item) => ({ zIndex: item.z, selector: cssPath(item.node), position: item.position }))
 	}
 
 	function detectStack() {
+		// Page globals and framework expandos are invisible to the isolated world, so ask the main world.
+		const probe = probeMain({ globals: ["__NEXT_DATA__", "__remixContext", "___gatsby", "Vue", "__NUXT__", "ng", "preact", "_$HY", "Alpine", "htmx", "qwikevents", "jQuery", "gsap", "THREE", "__REACT_QUERY_DEVTOOLS_GLOBAL_HOOK__", "__APOLLO_CLIENT__", "google_tag_manager", "gtag", "dataLayer", "fbq", "twq", "Sentry", "__SENTRY__", "hj", "analytics.identify", "posthog", "__cfRLUnblockHandlers", "va", "clarity", "Stripe", "firebase", "Intercom", "wp", "Shopify", "Static.SQUARESPACE_CACHE_VERSION", "webpackJsonp", "__turbopack_require__", "webpackChunk*"], scan: { limit: 400 } })
+		const globals = new Set(probe?.globals ?? [])
+		const scanFrameworks = new Set((probe?.scan ?? []).flatMap((hit) => hit.frameworks ?? []))
+		const win = (path) => globals.has(path)
 		const found = []
 		const check = (name, test) => {
 			try {
@@ -3423,7 +3792,7 @@
 		check("Next.js", () =>
 			scriptList.some((s) => s.includes("/_next/")) ||
 			document.querySelector("link[href*='/_next/'], #__next, script#__NEXT_DATA__") ||
-			window.__NEXT_DATA__,
+			win("__NEXT_DATA__"),
 		)
 		check("React", () =>
 			found.includes("Next.js") ||
@@ -3431,29 +3800,28 @@
 			found.includes("Gatsby") ||
 			scriptList.some((s) => s.includes("react") || s.includes("react-dom")) ||
 			document.querySelector("[data-reactroot], #__next, [data-react-helmet]") ||
-			[...document.querySelectorAll("body, body *")].slice(0, 100).some((el) =>
-				Object.keys(el).some((k) => k.startsWith("__reactFiber") || k.startsWith("__reactProps")),
-			),
+			scanFrameworks.has("React"),
 		)
 		check("Remix", () =>
 			scriptList.some((s) => s.includes("/build/") && s.includes("entry.client")) ||
-			window.__remixContext ||
+			win("__remixContext") ||
 			document.querySelector("script[data-remix]"),
 		)
-		check("Gatsby", () => document.querySelector("#___gatsby") || window.___gatsby)
+		check("Gatsby", () => document.querySelector("#___gatsby") || win("___gatsby"))
 		check("Vue", () =>
 			scriptList.some((s) => s.includes("vue")) ||
-			window.Vue ||
-			document.querySelector("[data-v-app], [data-v-]"),
+			win("Vue") ||
+			document.querySelector("[data-v-app]") ||
+			scanFrameworks.has("Vue"),
 		)
 		check("Nuxt", () =>
 			scriptList.some((s) => s.includes("/_nuxt/")) ||
-			window.__NUXT__ ||
+			win("__NUXT__") ||
 			document.querySelector("#__nuxt"),
 		)
 		check("Angular", () =>
 			scriptList.some((s) => s.includes("angular")) ||
-			window.ng ||
+			win("ng") ||
 			document.querySelector("[ng-version]"),
 		)
 		check("Svelte", () =>
@@ -3462,24 +3830,24 @@
 		)
 		check("Preact", () =>
 			scriptList.some((s) => s.includes("preact")) ||
-			window.preact ||
+			win("preact") ||
 			document.querySelector("[data-preact]"),
 		)
-		check("Solid", () => window._$HY || document.querySelector("[data-hk]"))
+		check("Solid", () => win("_$HY") || document.querySelector("[data-hk]"))
 		check("Lit", () => document.querySelector("[_$litType$]"))
-		check("Alpine.js", () => window.Alpine || document.querySelector("[x-data]"))
+		check("Alpine.js", () => win("Alpine") || document.querySelector("[x-data]"))
 		check("htmx", () =>
 			scriptList.some((s) => s.includes("htmx")) ||
-			window.htmx ||
+			win("htmx") ||
 			document.querySelector("[hx-get], [hx-post]"),
 		)
 		check("Astro", () =>
 			scriptList.some((s) => s.includes("astro")) ||
 			document.querySelector("[data-astro-cid], astro-island, astro-slot"),
 		)
-		check("Qwik", () => Boolean(document.querySelector("[q\\:container], [q\\:id]")) || window.qwikevents)
+		check("Qwik", () => Boolean(document.querySelector("[q\\:container], [q\\:id]")) || win("qwikevents"))
 		check("SvelteKit", () => Boolean(document.querySelector("[data-sveltekit-preload-data]")) || scriptList.some((s) => s.includes("/_app/immutable/")))
-		check("jQuery", () => scriptList.some((s) => s.includes("jquery")) || window.jQuery)
+		check("jQuery", () => scriptList.some((s) => s.includes("jquery")) || win("jQuery"))
 
 		check("Tailwind CSS", () =>
 			document.querySelector("[class*='dark:'], [class*='md:'], [class*='sm:'], [class*='lg:'], [class*='text-['], [class*='bg-['], [class*='space-y-'], [class*='space-x-']") ||
@@ -3505,40 +3873,40 @@
 			Boolean(document.querySelector("[class*='fa-'], [class*='fas '], [class*='fab '], link[href*='font-awesome']")),
 		)
 		check("Framer Motion", () => Boolean(document.querySelector("[data-framer-component-type], [style*='--framer-']")))
-		check("GSAP", () => scriptList.some((s) => s.includes("gsap")) || window.gsap)
-		check("Three.js", () => scriptList.some((s) => s.includes("three")) || window.THREE)
+		check("GSAP", () => scriptList.some((s) => s.includes("gsap")) || win("gsap"))
+		check("Three.js", () => scriptList.some((s) => s.includes("three")) || win("THREE"))
 
-		check("Redux", () => Boolean(window.__REDUX_DEVTOOLS_EXTENSION__ || document.querySelector("[data-redux]")))
-		check("TanStack Query", () => Boolean(window.__REACT_QUERY_DEVTOOLS_GLOBAL_HOOK__) || scriptList.some((s) => s.includes("react-query") || s.includes("tanstack")))
-		check("Apollo GraphQL", () => Boolean(window.__APOLLO_CLIENT__) || scriptList.some((s) => s.includes("apollo")))
+		check("Redux", () => Boolean(document.querySelector("[data-redux]")))
+		check("TanStack Query", () => Boolean(win("__REACT_QUERY_DEVTOOLS_GLOBAL_HOOK__")) || scriptList.some((s) => s.includes("react-query") || s.includes("tanstack")))
+		check("Apollo GraphQL", () => Boolean(win("__APOLLO_CLIENT__")) || scriptList.some((s) => s.includes("apollo")))
 
 		check("Google Tag Manager", () =>
 			scriptList.some((s) => s.includes("googletagmanager.com/gtm.js")) ||
 			domainList.includes("www.googletagmanager.com") ||
-			window.google_tag_manager,
+			win("google_tag_manager"),
 		)
 		check("Google Analytics", () =>
 			scriptList.some((s) => s.includes("google-analytics.com") || s.includes("googletagmanager.com/gtag")) ||
-			window.gtag ||
-			window.dataLayer,
+			win("gtag") ||
+			win("dataLayer"),
 		)
 		check("Meta (Facebook) Pixel", () =>
 			scriptList.some((s) => s.includes("connect.facebook.net")) ||
 			domainList.includes("connect.facebook.net") ||
-			window.fbq,
+			win("fbq"),
 		)
 		check("Twitter (X) Ads", () =>
 			scriptList.some((s) => s.includes("static.ads-twitter.com")) ||
 			domainList.includes("static.ads-twitter.com") ||
-			window.twq,
+			win("twq"),
 		)
-		check("Sentry", () => scriptList.some((s) => s.includes("sentry")) || window.Sentry || window.__SENTRY__)
-		check("Hotjar", () => scriptList.some((s) => s.includes("static.hotjar.com")) || window.hj)
-		check("Segment", () => scriptList.some((s) => s.includes("cdn.segment.com")) || window.analytics?.identify)
-		check("PostHog", () => scriptList.some((s) => s.includes("posthog")) || window.posthog)
-		check("Cloudflare Insights", () => Boolean(window.__cfRLUnblockHandlers || domainList.includes("static.cloudflareinsights.com")))
-		check("Vercel Analytics", () => Boolean(window.va || scriptList.some((s) => s.includes("/_vercel/insights"))))
-		check("Microsoft Clarity", () => Boolean(window.clarity || scriptList.some((s) => s.includes("clarity.ms"))))
+		check("Sentry", () => scriptList.some((s) => s.includes("sentry")) || win("Sentry") || win("__SENTRY__"))
+		check("Hotjar", () => scriptList.some((s) => s.includes("static.hotjar.com")) || win("hj"))
+		check("Segment", () => scriptList.some((s) => s.includes("cdn.segment.com")) || win("analytics.identify"))
+		check("PostHog", () => scriptList.some((s) => s.includes("posthog")) || win("posthog"))
+		check("Cloudflare Insights", () => Boolean(win("__cfRLUnblockHandlers") || domainList.includes("static.cloudflareinsights.com")))
+		check("Vercel Analytics", () => Boolean(win("va") || scriptList.some((s) => s.includes("/_vercel/insights"))))
+		check("Microsoft Clarity", () => Boolean(win("clarity") || scriptList.some((s) => s.includes("clarity.ms"))))
 
 		check("Clerk", () =>
 			scriptList.some((s) => s.includes("clerk")) ||
@@ -3547,10 +3915,10 @@
 		check("Stripe", () =>
 			scriptList.some((s) => s.includes("js.stripe.com")) ||
 			domainList.includes("js.stripe.com") ||
-			window.Stripe,
+			win("Stripe"),
 		)
 		check("Supabase", () => domainList.some((d) => d.includes("supabase.co")) || scriptList.some((s) => s.includes("supabase")))
-		check("Firebase", () => Boolean(window.firebase) || domainList.some((d) => d.includes("firebaseapp.com")))
+		check("Firebase", () => Boolean(win("firebase")) || domainList.some((d) => d.includes("firebaseapp.com")))
 		check("Tolt", () =>
 			domainList.some((d) => d.includes("tolt.io")) ||
 			scriptList.some((s) => s.includes("tolt")),
@@ -3558,18 +3926,18 @@
 		check("Intercom", () =>
 			scriptList.some((s) => s.includes("widget.intercom.io")) ||
 			domainList.includes("widget.intercom.io") ||
-			window.Intercom,
+			win("Intercom"),
 		)
 
-		check("WordPress", () => document.querySelector("meta[name='generator'][content*='WordPress']") || window.wp)
-		check("Shopify", () => window.Shopify)
+		check("WordPress", () => document.querySelector("meta[name='generator'][content*='WordPress']") || win("wp"))
+		check("Shopify", () => win("Shopify"))
 		check("Webflow", () => Boolean(document.querySelector("html.w-mod-js, [data-w-id]")) || scriptList.some((s) => s.includes("webflow")))
-		check("Squarespace", () => Boolean(window.Static?.SQUARESPACE_CACHE_VERSION || document.querySelector("link[href*='squarespace']")))
+		check("Squarespace", () => Boolean(win("Static.SQUARESPACE_CACHE_VERSION") || document.querySelector("link[href*='squarespace']")))
 
 		check("Webpack", () =>
 			scriptList.some((s) => s.includes("webpack") || s.includes("chunks/")) ||
-			window.webpackChunk ||
-			window.webpackJsonp,
+			win("webpackChunk*") ||
+			win("webpackJsonp"),
 		)
 		check("Vite", () =>
 			scriptList.some((s) => s.includes("/@vite/") || s.includes("vite/")) ||
@@ -3577,7 +3945,7 @@
 		)
 		check("Turbopack", () =>
 			scriptList.some((s) => s.includes("turbopack")) ||
-			window.__turbopack_require__,
+			win("__turbopack_require__"),
 		)
 
 		check("Service Worker", () => Boolean(navigator.serviceWorker?.controller))
@@ -3768,7 +4136,7 @@
 	function onDeepClick(event) {
 		if (isDevKitEvent(event)) return
 		const node = event.target
-		if (!(node instanceof Element) || node === shadowHost || node.id === "devkit-shadow-host" || node.closest?.(".dk-root, #devkit-shadow-host")) return
+		if (!(node instanceof Element) || isDevKitNode(node)) return
 		event.preventDefault()
 		event.stopPropagation()
 		deepInspectPending = false
@@ -3779,8 +4147,6 @@
 		hideFloatingCta()
 		const data = deepInspectElement(node)
 		showHud("Deep inspection", data)
-
-		window.__devkitDeepResult = data
 	}
 
 	function startDeepInspect() {
@@ -3806,11 +4172,12 @@
 					easing: anim.effect?.getTiming?.()?.easing ?? null,
 					selector: target ? cssPath(target) : null,
 				})
+				if (allAnimations.length >= 200) break
 			}
 		} catch {  }
 
 		const transitioned = []
-		for (const node of [...document.querySelectorAll("body *")].slice(0, 2000)) {
+		scanElements("body *", (node) => {
 			const style = getComputedStyle(node)
 			if (style.animationName && style.animationName !== "none") {
 				transitioned.push({
@@ -3820,8 +4187,9 @@
 					animationTimingFunction: style.animationTimingFunction,
 					animationIterationCount: style.animationIterationCount,
 				})
+				if (transitioned.length >= 50) return false
 			}
-		}
+		}, { limit: 5000, ms: 250 })
 
 		return {
 			activeAnimations: allAnimations,
@@ -3830,99 +4198,54 @@
 		}
 	}
 
-	function scanEventListeners() {
-		const results = []
-		const attrs = [
-			"onclick", "onmouseover", "onmouseout", "onmousedown", "onmouseup", "onmousemove",
-			"onkeydown", "onkeyup", "onkeypress", "onfocus", "onblur",
-			"onchange", "oninput", "onsubmit", "onscroll", "onresize",
-			"ontouchstart", "ontouchend", "ontouchmove", "onwheel", "ondrag", "ondrop",
-			"onload", "onerror", "onplay", "onpause",
-		]
 
-		for (const node of [...document.querySelectorAll("body *")].slice(0, 3000)) {
-			const events = []
-			for (const attr of attrs) {
-				if (node.hasAttribute(attr) || typeof node[attr] === "function") {
-					events.push(attr.replace("on", ""))
-				}
-			}
+	function enhancedA11yChecks(issues, add, track = () => {}) {
+		if (!document.querySelector("main, [role=main]")) add("moderate", "landmark-main", "Page has no <main> landmark")
+		if (!document.querySelector("nav, [role=navigation]")) add("minor", "landmark-nav", "Page has no <nav> landmark")
 
-			const fw = getFrameworkBindings(node)
-			if (events.length || fw.length) {
-				results.push({
-					selector: cssPath(node),
-					tag: node.tagName.toLowerCase(),
-					inlineEvents: events,
-					frameworkBindings: fw,
-				})
-			}
-		}
-
-		const byEventType = {}
-		for (const r of results) {
-			for (const e of r.inlineEvents) byEventType[e] = (byEventType[e] ?? 0) + 1
-		}
-
-		return {
-			elementsWithListeners: results.length,
-			byEventType,
-			details: results.slice(0, 100),
-		}
-	}
-
-	function enhancedA11yChecks(issues, add) {
-		if (!document.querySelector("main")) add("moderate", "landmark-main", "Page has no <main> landmark")
-		if (!document.querySelector("nav")) add("minor", "landmark-nav", "Page has no <nav> landmark")
-
-		const skipLink = document.querySelector("a[href='#main-content'], a[href='#content'], a.skip-link, a.skip-to-content")
-		if (!skipLink) add("minor", "skip-link", "No skip-to-content link found")
+		const skipLink = document.querySelector("a[href='#main-content'], a[href='#content'], a[href='#main'], a.skip-link, a.skip-to-content")
+		if (!skipLink) add("minor", "skip-link", "No skip to content link found")
 
 		for (const media of document.querySelectorAll("video[autoplay], audio[autoplay]")) {
 			if (!media.muted) add("serious", "autoplay-muted", "Autoplaying media without muted attribute", media)
 		}
 
-		for (const el of document.querySelectorAll("*:focus")) {
-			const style = getComputedStyle(el)
-			if (style.outlineStyle === "none" && style.boxShadow === "none") {
-				add("moderate", "focus-visible", "Focused element has no visible focus indicator", el)
-			}
-		}
-
 		for (const iframe of document.querySelectorAll("iframe:not([title])")) {
-			add("serious", "iframe-title", "<iframe> element missing title attribute (WCAG 4.1.2)", iframe)
+			if (!iframe.closest("[aria-hidden='true']")) add("serious", "iframe-title", "<iframe> element missing title attribute (WCAG 4.1.2)", iframe)
 		}
 
 		let smallTargetCount = 0
-		for (const btn of document.querySelectorAll("button, a, input[type=checkbox], input[type=radio]")) {
-			const rect = btn.getBoundingClientRect()
+		track(scanElements("button, a[href], input[type=checkbox], input[type=radio]", (target) => {
+			const rect = target.getBoundingClientRect()
 			if (rect.width > 0 && rect.height > 0 && (rect.width < 24 || rect.height < 24)) {
-				add("minor", "target-size", `Target size is small (${Math.round(rect.width)}×${Math.round(rect.height)}px, aim for ≥24×24px)`, btn)
+				// Inline links inside running text are exempt from the WCAG 2.2 target size rule.
+				if (target.tagName === "A" && getComputedStyle(target).display === "inline" && hasOwnText(target.parentElement ?? target)) return
+				add("minor", "target-size", `Target size is small (${Math.round(rect.width)}×${Math.round(rect.height)}px, aim for at least 24×24px)`, target)
 				smallTargetCount++
-				if (smallTargetCount >= 10) break
+				if (smallTargetCount >= 10) return false
 			}
-		}
+		}, { limit: 3000, ms: 150 }))
 
 		for (const img of document.querySelectorAll("img[alt]")) {
 			const alt = img.alt.trim().toLowerCase()
-			if (/^(image|photo|picture|icon|graphic|logo image)$/.test(alt)) {
+			if (/^(image|photo|picture|icon|graphic|logo image|img)$/.test(alt)) {
 				add("minor", "redundant-alt", `Alt text "${img.alt}" is redundant (avoid generic words like "image" or "photo")`, img)
 			}
 		}
 
 		const ids = new Set()
 		let dupCount = 0
-		for (const el of document.querySelectorAll("[id]")) {
-			const id = el.id.trim()
-			if (!id) continue
+		track(scanElements("[id]", (node) => {
+			const id = node.id.trim()
+			if (!id) return
 			if (ids.has(id)) {
-				add("moderate", "duplicate-id", `Duplicate ID "#${id}" found in DOM`, el)
+				add("moderate", "duplicate-id", `Duplicate ID "#${id}" found in DOM`, node)
 				dupCount++
-				if (dupCount >= 5) break
+				if (dupCount >= 5) return false
 			} else {
 				ids.add(id)
 			}
-		}
+		}, { limit: 8000, ms: 100 }))
 	}
 
 	let lastGeneratedPassword = ""
@@ -4130,7 +4453,7 @@
 				return "demo-upload.png"
 			}
 			case "color": {
-				return "#3b82f6"
+				return "#ff5a1f"
 			}
 			case "range": {
 				const min = Number(field.min) || 0
@@ -4178,22 +4501,22 @@
 			const ctx = canvas.getContext("2d")
 			if (ctx) {
 				const grad = ctx.createLinearGradient(0, 0, 400, 300)
-				grad.addColorStop(0, "#3B82F6")
+				grad.addColorStop(0, "#ff5a1f")
 				grad.addColorStop(1, "#1D4ED8")
 				ctx.fillStyle = grad
 				ctx.fillRect(0, 0, 400, 300)
 
-				ctx.fillStyle = "rgba(255, 255, 255, 0.2)"
+				ctx.fillStyle = "rgba(243, 236, 224, 0.2)"
 				ctx.beginPath()
 				ctx.arc(200, 110, 45, 0, Math.PI * 2)
 				ctx.fill()
 
 				ctx.fillStyle = "#FFFFFF"
-				ctx.font = "bold 20px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+				ctx.font = "bold 20px ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
 				ctx.textAlign = "center"
 				ctx.fillText("SAMPLE PROPERTY IMAGE", 200, 190)
-				ctx.font = "14px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
-				ctx.fillStyle = "rgba(255, 255, 255, 0.8)"
+				ctx.font = "14px ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
+				ctx.fillStyle = "rgba(243, 236, 224, 0.8)"
 				ctx.fillText("400 × 300 px  •  DevKit Preview", 200, 220)
 
 				const dataUrl = canvas.toDataURL("image/png")
@@ -4331,7 +4654,13 @@
 		return fallback
 	}
 
+	let formRunId = 0
+	let formDebounce = null
 	function stopFormFiller() {
+		formRunId++
+		clearTimeout(formDebounce)
+		formDebounce = null
+		activeCleanups.delete("form-filler")
 		if (formStepObserver) {
 			formStepObserver.disconnect()
 			formStepObserver = null
@@ -4574,7 +4903,7 @@
 		const triggers = [...document.querySelectorAll(
 			'[role="combobox"], [aria-haspopup="listbox"], [aria-haspopup="menu"], [aria-expanded][aria-haspopup], [class*="select-trigger"], button[class*="select"]'
 		)]
-			.filter(el => !el.closest('#dk-floating-cta, #dk-hud, .dk-overlay, [class*="dk-"], [id*="dk-"]'))
+			.filter(el => !isDevKitNode(el))
 			.filter(isVisibleField)
 
 		let count = 0
@@ -4693,7 +5022,7 @@
 		const customChecks = [...document.querySelectorAll(
 			'[role="checkbox"], [role="switch"], [role="radio"], [role="menuitemcheckbox"], [role="menuitemradio"]'
 		)]
-			.filter(el => !el.closest('#dk-floating-cta, #dk-hud, .dk-overlay, [class*="dk-"], [id*="dk-"]'))
+			.filter(el => !isDevKitNode(el))
 			.filter(isVisibleField)
 
 		for (const check of customChecks) {
@@ -4739,7 +5068,7 @@
 		].join(", ")
 
 		const genericOptions = [...document.querySelectorAll(chipSelector)]
-			.filter(el => !el.closest('#dk-floating-cta, #dk-hud, .dk-overlay, [class*="dk-"], [id*="dk-"]'))
+			.filter(el => !isDevKitNode(el))
 			.filter(isVisibleField)
 			.filter(el => {
 				const text = (el.textContent || "").trim()
@@ -4857,7 +5186,7 @@
 		const allInputs = [
 			...document.querySelectorAll("input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='reset']):not([role='combobox']), textarea, select, [contenteditable='true']")
 		]
-			.filter(el => !el.closest('#dk-floating-cta, #dk-hud, .dk-overlay, [class*="dk-"], [id*="dk-"]'))
+			.filter(el => !isDevKitNode(el))
 		const visible = allInputs.filter(isVisibleField)
 		let count = 0
 		const radioGroups = new Set()
@@ -4904,6 +5233,8 @@
 		const isWatchSteps = mode.includes("Watch & fill")
 
 		stopFormFiller()
+		ensurePageStyles()
+		const runId = formRunId
 
 		document.querySelectorAll("[data-dk-filled]").forEach(el => el.removeAttribute("data-dk-filled"))
 
@@ -4922,13 +5253,14 @@
 		if (isAutoAdvance && !isClear) {
 			;(async () => {
 				let stepsRemaining = 8
-				while (stepsRemaining > 0) {
+				while (stepsRemaining > 0 && runId === formRunId) {
 					stepsRemaining--
 					const nextBtn = findNextButton()
 					if (!nextBtn) break
 					simulatePlaywrightClick(nextBtn)
 					currentStep++
 					await new Promise((r) => setTimeout(r, 650))
+					if (runId !== formRunId) return
 					const newCount = await fillFormStep(isClear, isEdgeCase, payload, filledList)
 					totalFilled += newCount
 					if (newCount === 0) break
@@ -4938,10 +5270,10 @@
 		}
 
 		if (isWatchSteps && !isClear) {
-			let debounce = null
 			formStepObserver = new MutationObserver(() => {
-				clearTimeout(debounce)
-				debounce = setTimeout(async () => {
+				clearTimeout(formDebounce)
+				formDebounce = setTimeout(async () => {
+					if (runId !== formRunId) return
 					const newlyFilled = await fillFormStep(isClear, isEdgeCase, payload, filledList)
 					totalFilled += newlyFilled
 					if (newlyFilled > 0) {
@@ -4963,6 +5295,7 @@
 			`${totalFilled} field${totalFilled === 1 ? "" : "s"} filled ${currentStep > 1 ? `across ${currentStep} steps` : ""}${isWatchSteps ? " (Watching steps)" : ""}`,
 			() => stopFormFiller()
 		)
+		if (isWatchSteps || isAutoAdvance) registerCleanup("form-filler", () => stopFormFiller())
 
 		return {
 			ok: true,
@@ -4972,7 +5305,7 @@
 				mode,
 				profile,
 				sampleFields: filledList.slice(0, 60),
-				message: `Successfully populated ${totalFilled} fields${currentStep > 1 ? ` across ${currentStep} steps` : ""}. Click '✕ Close Tool' on page when done.`,
+				message: `Successfully populated ${totalFilled} fields${currentStep > 1 ? ` across ${currentStep} steps` : ""}. Use Close on the page bar to stop watching.`,
 			},
 		}
 	}
@@ -4986,24 +5319,27 @@
 		return e.key === "Escape" || e.key === "Esc" || e.code === "Escape" || e.keyCode === 27
 	}
 
-	function requestScreenshot() {
-		return new Promise((resolve, reject) => {
-			try {
-				runtime.runtime.sendMessage({ type: "screenshot" }, (response) => {
-					if (runtime.runtime.lastError) {
-						reject(new Error(runtime.runtime.lastError.message))
-						return
-					}
-					if (!response?.ok) {
-						reject(new Error(response?.error ?? "Screenshot failed"))
-						return
-					}
-					resolve(response.dataUrl)
-				})
-			} catch (err) {
-				reject(err)
+	function nextFrame() {
+		return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+	}
+
+	// Our own overlay must not end up in the screenshot, so hide the host while capturing.
+	// The service worker queues captures to respect the captureVisibleTab rate limit.
+	async function requestScreenshot() {
+		const host = shadowHost
+		const previous = host?.style.getPropertyValue("visibility")
+		if (host) host.style.setProperty("visibility", "hidden", "important")
+		try {
+			if (host) await nextFrame()
+			const response = await sendRuntime({ type: "screenshot" })
+			if (!response?.ok) throw new Error(response?.error ?? "Screenshot failed")
+			return response.dataUrl
+		} finally {
+			if (host) {
+				if (previous) host.style.setProperty("visibility", previous, "important")
+				else host.style.removeProperty("visibility")
 			}
-		})
+		}
 	}
 
 	function dataUrlToImageEl(dataUrl) {
@@ -5015,26 +5351,14 @@
 		})
 	}
 
-	function cropDataUrl(dataUrl, x, y, w, h, dpr) {
-		return new Promise(async (resolve, reject) => {
-			try {
-				const img = await dataUrlToImageEl(dataUrl)
-				const canvas = document.createElement("canvas")
-				canvas.width = Math.round(w * dpr)
-				canvas.height = Math.round(h * dpr)
-				const ctx = canvas.getContext("2d")
-				ctx.drawImage(
-					img,
-					Math.round(x * dpr), Math.round(y * dpr),
-					Math.round(w * dpr), Math.round(h * dpr),
-					0, 0,
-					Math.round(w * dpr), Math.round(h * dpr)
-				)
-				resolve(canvas.toDataURL("image/png"))
-			} catch (err) {
-				reject(err)
-			}
-		})
+	async function cropDataUrl(dataUrl, x, y, w, h, dpr) {
+		const img = await dataUrlToImageEl(dataUrl)
+		const canvas = document.createElement("canvas")
+		canvas.width = Math.round(w * dpr)
+		canvas.height = Math.round(h * dpr)
+		const ctx = canvas.getContext("2d")
+		ctx.drawImage(img, Math.round(x * dpr), Math.round(y * dpr), canvas.width, canvas.height, 0, 0, canvas.width, canvas.height)
+		return canvas.toDataURL("image/png")
 	}
 
 	function cleanupSnipOverlay() {
@@ -5183,7 +5507,7 @@
 			try { overlay.focus({ preventScroll: true }) } catch {  }
 
 			showFloatingCta(
-				"✂️ Snipping Tool",
+				"Sidekick: Snipping tool",
 				"Draw a region · Esc to cancel",
 				cancelAndExit
 			)
@@ -5215,6 +5539,10 @@
 			document.body.scrollWidth,
 			document.documentElement.scrollWidth
 		)
+		// Browsers cap canvas size (about 32k px per side), so very long pages are truncated.
+		const maxCssHeight = Math.floor(32000 / dpr)
+		const truncated = fullH > maxCssHeight
+		const captureH = Math.min(fullH, maxCssHeight)
 
 		const savedX = window.scrollX
 		const savedY = window.scrollY
@@ -5232,27 +5560,24 @@
 		document.addEventListener("keydown", onKey, true)
 		activeSnipCancel = () => { cancelled = true }
 
+		// Fixed and sticky elements stay visible in the first section only, otherwise headers repeat.
 		const fixedEls = []
-		try {
-			const all = document.querySelectorAll("body *")
-			for (const node of all) {
-				if (isDevKitNode(node)) continue
-				const pos = getComputedStyle(node).position
-				if (pos === "fixed" || pos === "sticky") {
-					fixedEls.push({ node, orig: node.style.cssText })
-					node.style.setProperty("visibility", "hidden", "important")
-				}
-			}
-		} catch {  }
+		scanElements("body *", (node) => {
+			const pos = getComputedStyle(node).position
+			if (pos === "fixed" || pos === "sticky") fixedEls.push({ node, orig: node.style.cssText })
+		}, { limit: 20000, ms: 400 })
+		const hideFixed = () => {
+			for (const { node } of fixedEls) node.style.setProperty("visibility", "hidden", "important")
+		}
 
-		const totalChunks = Math.ceil(fullH / viewH)
+		const totalChunks = Math.ceil(captureH / viewH)
 		const canvas = document.createElement("canvas")
 		canvas.width = Math.round(fullW * dpr)
-		canvas.height = Math.round(fullH * dpr)
+		canvas.height = Math.round(captureH * dpr)
 		const ctx = canvas.getContext("2d")
 
 		showFloatingCta(
-			"📸 Full Page Capture",
+			"Sidekick: Full page capture",
 			`Capturing… 0/${totalChunks} sections · Esc to cancel`,
 			() => { cancelled = true }
 		)
@@ -5261,15 +5586,15 @@
 			for (let i = 0; i < totalChunks; i++) {
 				if (cancelled) break
 
-				const scrollY = i * viewH
-				window.scrollTo(0, scrollY)
+				if (i === 1) hideFixed()
+				window.scrollTo({ left: 0, top: i * viewH, behavior: "instant" })
 
-				await new Promise(r => setTimeout(r, 250))
+				await new Promise(r => setTimeout(r, 200))
 
 				if (cancelled) break
 
 				updateFloatingCta(
-					"📸 Full Page Capture",
+					"Sidekick: Full page capture",
 					`Capturing… ${i + 1}/${totalChunks} sections · Esc to cancel`,
 					() => { cancelled = true }
 				)
@@ -5295,7 +5620,7 @@
 			document.removeEventListener("keydown", onKey, true)
 			activeSnipCancel = null
 
-			window.scrollTo(savedX, savedY)
+			window.scrollTo({ left: savedX, top: savedY, behavior: "instant" })
 			for (const { node, orig } of fixedEls) {
 				node.style.cssText = orig
 			}
@@ -5310,8 +5635,9 @@
 		return {
 			dataUrl: result,
 			width: Math.round(fullW * dpr),
-			height: Math.round(fullH * dpr),
+			height: Math.round(captureH * dpr),
 			mode: "Full page (scroll)",
+			truncated,
 		}
 	}
 
@@ -5352,6 +5678,284 @@
 		}
 	}
 
+	function toneCounts(sections) {
+		const counts = { good: 0, warn: 0, bad: 0, info: 0 }
+		for (const section of sections) for (const item of section.items) counts[item.tone] = (counts[item.tone] ?? 0) + 1
+		return counts
+	}
+
+	function cspDirective(policy, name) {
+		const match = String(policy || "")
+			.split(";")
+			.map((part) => part.trim())
+			.find((part) => part.toLowerCase().startsWith(`${name} `) || part.toLowerCase() === name)
+		return match ? match.slice(name.length).trim() : null
+	}
+
+	function checkHeaders(data, isHttps) {
+		const items = []
+		const headers = data.headers ?? {}
+		const csp = headers["content-security-policy"]
+		if (!csp) {
+			items.push({
+				label: "Content-Security-Policy",
+				detail: headers["content-security-policy-report-only"] ? "Only a report-only policy is set, nothing is enforced" : "Missing, so injected scripts run unrestricted",
+				tone: "bad",
+			})
+		} else {
+			const scripts = cspDirective(csp, "script-src") ?? cspDirective(csp, "default-src") ?? ""
+			const problems = []
+			if (/'unsafe-inline'/.test(scripts) && !/'nonce-|'sha(256|384|512)-|'strict-dynamic'/.test(scripts)) problems.push("allows 'unsafe-inline' scripts")
+			if (/'unsafe-eval'/.test(scripts)) problems.push("allows 'unsafe-eval'")
+			if (/(^|\s)(\*|https?:|data:)(\s|$)/.test(scripts)) problems.push("allows scripts from any host or data: URLs")
+			if (!scripts) problems.push("has no script-src or default-src")
+			items.push({ label: "Content-Security-Policy", detail: problems.length ? `Present but ${problems.join(", ")}` : "Present with a restrictive script policy", tone: problems.length ? "warn" : "good" })
+		}
+		const hsts = headers["strict-transport-security"]
+		if (!isHttps) {
+			items.push({ label: "HTTPS", detail: "Page is served over plain HTTP", tone: "bad" })
+		} else if (!hsts) {
+			items.push({ label: "Strict-Transport-Security", detail: "Missing, first visits can be downgraded to HTTP", tone: "warn" })
+		} else {
+			const maxAge = Number(/max-age=(\d+)/i.exec(hsts)?.[1] ?? 0)
+			items.push({
+				label: "Strict-Transport-Security",
+				detail: maxAge < 15552000 ? `max-age ${maxAge}s is below 180 days` : `max-age ${maxAge}s${/includesubdomains/i.test(hsts) ? ", includeSubDomains" : ""}${/preload/i.test(hsts) ? ", preload" : ""}`,
+				tone: maxAge < 15552000 ? "warn" : "good",
+			})
+		}
+		const nosniff = /nosniff/i.test(headers["x-content-type-options"] ?? "")
+		items.push({ label: "X-Content-Type-Options", detail: nosniff ? "nosniff" : "Missing nosniff, browsers may MIME sniff responses", tone: nosniff ? "good" : "warn" })
+		const xfo = headers["x-frame-options"]
+		const frameAncestors = cspDirective(csp, "frame-ancestors")
+		items.push({
+			label: "Clickjacking protection",
+			detail: frameAncestors ? `CSP frame-ancestors ${frameAncestors}` : xfo ? `X-Frame-Options ${xfo}` : "Neither X-Frame-Options nor CSP frame-ancestors is set",
+			tone: frameAncestors || xfo ? "good" : "warn",
+		})
+		const referrer = headers["referrer-policy"]
+		items.push({
+			label: "Referrer-Policy",
+			detail: referrer ?? "Not set, browsers default to strict-origin-when-cross-origin",
+			tone: !referrer ? "info" : /unsafe-url|no-referrer-when-downgrade/i.test(referrer) ? "warn" : "good",
+		})
+		items.push({ label: "Permissions-Policy", detail: headers["permissions-policy"] ? "Set" : "Not set, powerful features fall back to defaults", tone: headers["permissions-policy"] ? "good" : "info" })
+		for (const [name, label] of [["cross-origin-opener-policy", "COOP"], ["cross-origin-embedder-policy", "COEP"], ["cross-origin-resource-policy", "CORP"]]) {
+			items.push({ label, detail: headers[name] ?? "Not set", tone: headers[name] ? "good" : "info" })
+		}
+		if (headers["x-powered-by"]) items.push({ label: "X-Powered-By", detail: `Discloses ${headers["x-powered-by"]}`, tone: "warn" })
+		if (headers.server && /\d/.test(headers.server)) items.push({ label: "Server", detail: `Discloses a version: ${headers.server}`, tone: "info" })
+		if (headers["access-control-allow-origin"] === "*") items.push({ label: "CORS", detail: "Access-Control-Allow-Origin is * on the document", tone: "info" })
+		return items
+	}
+
+	function checkCookies(cookies, isHttps) {
+		const items = []
+		for (const cookie of cookies.slice(0, 60)) {
+			const flags = [cookie.secure ? "Secure" : "no Secure", cookie.httpOnly ? "HttpOnly" : "readable by JS", `SameSite=${cookie.sameSite}`]
+			const sensitive = /sess|token|auth|sid|jwt|login|csrf|xsrf/i.test(cookie.name)
+			let tone = "good"
+			if (isHttps && !cookie.secure) tone = "bad"
+			else if (sensitive && !cookie.httpOnly && !/csrf|xsrf/i.test(cookie.name)) tone = "bad"
+			else if (cookie.sameSite === "no_restriction" || cookie.sameSite === "none") tone = "warn"
+			else if (!cookie.httpOnly || cookie.sameSite === "unspecified") tone = "info"
+			items.push({ label: cookie.name, detail: `${flags.join(" · ")} · ${cookie.domain}${cookie.path}`, tone })
+		}
+		return items.sort((a, b) => ["bad", "warn", "info", "good"].indexOf(a.tone) - ["bad", "warn", "info", "good"].indexOf(b.tone))
+	}
+
+	async function securityCheck() {
+		const isHttps = location.protocol === "https:"
+		const response = await sendRuntime({ type: "security:check", url: location.href })
+		const data = response?.ok ? response.data : null
+		const sections = []
+
+		if (!data || (data.error && !data.status)) {
+			sections.push({ title: "Response headers", items: [{ label: "Headers", detail: `Could not fetch the page headers: ${data?.error ?? response?.error ?? "unavailable"}`, tone: "warn" }] })
+		} else {
+			sections.push({ title: "Response headers", items: checkHeaders(data, isHttps) })
+		}
+		sections.push({ title: "Cookies", items: checkCookies(data?.cookies ?? [], isHttps) })
+
+		const pageItems = []
+		const mixed = []
+		if (isHttps) {
+			scanElements("img[src], script[src], link[href], iframe[src], video[src], audio[src], source[src], embed[src], object[data]", (node) => {
+				const url = node.getAttribute("src") ?? node.getAttribute("href") ?? node.getAttribute("data") ?? ""
+				if (/^http:/i.test(url)) mixed.push(node)
+			}, { limit: 5000, ms: 150 })
+		}
+		for (const node of mixed.slice(0, 15)) {
+			pageItems.push({ label: "Mixed content", detail: `<${node.tagName.toLowerCase()}> loads ${(node.getAttribute("src") ?? node.getAttribute("href") ?? node.getAttribute("data")).slice(0, 120)}`, tone: node.tagName === "SCRIPT" || node.tagName === "IFRAME" ? "bad" : "warn", selector: cssPath(node) })
+		}
+
+		for (const form of [...document.forms].slice(0, 50)) {
+			const hasPassword = Boolean(form.querySelector("input[type=password]"))
+			if (/^http:/i.test(form.action) && (isHttps || hasPassword)) {
+				pageItems.push({ label: "Insecure form", detail: `Form submits to ${form.action.slice(0, 120)}`, tone: "bad", selector: cssPath(form) })
+			} else if (!isHttps && hasPassword) {
+				pageItems.push({ label: "Password over HTTP", detail: "Password form on a page served over HTTP", tone: "bad", selector: cssPath(form) })
+			}
+		}
+
+		let unlabeledPasswords = 0
+		for (const input of document.querySelectorAll("input[type=password]")) {
+			const autocomplete = (input.getAttribute("autocomplete") ?? "").toLowerCase()
+			if (!/current-password|new-password|one-time-code/.test(autocomplete)) {
+				unlabeledPasswords++
+				if (unlabeledPasswords <= 5) {
+					pageItems.push({ label: "Password autocomplete", detail: autocomplete ? `autocomplete="${autocomplete}", prefer current-password or new-password` : "No autocomplete hint, add current-password or new-password", tone: "info", selector: cssPath(input) })
+				}
+			}
+		}
+
+		const inlineScripts = [...document.querySelectorAll("script:not([src])")].filter((script) => !/json|importmap|template|text\/(html|x-)/i.test(script.type))
+		if (inlineScripts.length) {
+			pageItems.push({ label: "Inline scripts", detail: `${inlineScripts.length} inline <script> blocks, a strict CSP needs nonces or hashes for these`, tone: "info", selector: cssPath(inlineScripts[0]) })
+		}
+		let handlerCount = 0
+		let firstHandler = null
+		scanElements("body *", (node) => {
+			for (const attr of node.attributes) {
+				if (/^on[a-z]+$/.test(attr.name)) {
+					handlerCount++
+					firstHandler ??= node
+				}
+			}
+		}, { limit: 8000, ms: 150 })
+		if (handlerCount) pageItems.push({ label: "Inline event handlers", detail: `${handlerCount} onclick style attributes, blocked by a strict CSP`, tone: "warn", selector: cssPath(firstHandler) })
+
+		const openers = [...document.querySelectorAll("a[target=_blank]")].filter((a) => !/noopener|noreferrer/i.test(a.rel) && a.origin !== location.origin)
+		if (openers.length) {
+			pageItems.push({ label: "target=_blank links", detail: `${openers.length} external links without rel=noopener (modern browsers imply it, older ones do not)`, tone: "info", selector: cssPath(openers[0]) })
+		}
+
+		const origins = new Map()
+		for (const script of document.querySelectorAll("script[src]")) {
+			try {
+				const url = new URL(script.src, location.href)
+				if (url.origin === location.origin) continue
+				const entry = origins.get(url.origin) ?? { count: 0, withoutIntegrity: 0, node: script }
+				entry.count++
+				if (!script.integrity) entry.withoutIntegrity++
+				origins.set(url.origin, entry)
+			} catch {}
+		}
+		const thirdPartyItems = [...origins.entries()]
+			.sort((a, b) => b[1].count - a[1].count)
+			.slice(0, 30)
+			.map(([origin, entry]) => ({
+				label: origin.replace(/^https?:\/\//, ""),
+				detail: `${entry.count} script${entry.count === 1 ? "" : "s"}${entry.withoutIntegrity ? `, ${entry.withoutIntegrity} without Subresource Integrity` : ""}`,
+				tone: origin.startsWith("http:") ? "bad" : "info",
+				selector: cssPath(entry.node),
+			}))
+
+		sections.push({ title: "Page checks", items: pageItems })
+		sections.push({ title: "Third party script origins", items: thirdPartyItems })
+		const counts = toneCounts(sections)
+		const summary = [
+			{ label: "Problems", value: counts.bad, tone: counts.bad ? "bad" : "good" },
+			{ label: "Warnings", value: counts.warn, tone: counts.warn ? "warn" : "good" },
+			{ label: "Cookies", value: data?.cookies?.length ?? 0, tone: "info" },
+			{ label: "Script origins", value: origins.size, tone: origins.size > 10 ? "warn" : "info" },
+		]
+		if (data?.status) summary.push({ label: "HTTP status", value: data.status, tone: data.status < 400 ? "good" : "bad" })
+		return report(summary, sections)
+	}
+
+	function imageAudit() {
+		const dpr = window.devicePixelRatio || 1
+		const viewH = window.innerHeight
+		const sizes = new Map()
+		for (const entry of performance.getEntriesByType("resource")) {
+			if (entry.initiatorType === "img" || entry.initiatorType === "css" || entry.initiatorType === "other") {
+				sizes.set(entry.name, entry.encodedBodySize || entry.transferSize || 0)
+			}
+		}
+		const groups = { broken: [], alt: [], dims: [], oversized: [], lazy: [], eager: [], legacy: [] }
+		let total = 0
+		let wastedBytes = 0
+		const scan = scanElements("img", (img) => {
+			const src = img.currentSrc || img.src
+			if (!src) return
+			total++
+			const name = (src.startsWith("data:") ? "inline data URL" : src.split("/").pop().split("?")[0]) || src
+			const label = name.slice(0, 60)
+			const selector = cssPath(img)
+			if (img.complete && img.naturalWidth === 0) {
+				groups.broken.push({ label, detail: `Failed to load ${src.slice(0, 160)}`, tone: "bad", selector })
+				return
+			}
+			const rect = img.getBoundingClientRect()
+			const rendered = rect.width > 0 && rect.height > 0
+			if (!img.hasAttribute("alt") && !img.closest("[aria-hidden='true']")) {
+				groups.alt.push({ label, detail: "Missing alt attribute (use alt=\"\" for decorative images)", tone: "bad", selector })
+			}
+			if (rendered && (!img.getAttribute("width") || !img.getAttribute("height"))) {
+				const style = getComputedStyle(img)
+				if (style.aspectRatio === "auto" && style.position !== "absolute" && style.position !== "fixed") {
+					groups.dims.push({ label, detail: "No width and height attributes or CSS aspect-ratio, the layout shifts when it loads", tone: "warn", selector })
+				}
+			}
+			const bytes = sizes.get(src) ?? 0
+			if (rendered && img.naturalWidth) {
+				const needed = Math.ceil(rect.width * dpr)
+				const ratio = img.naturalWidth / needed
+				if (ratio > 1.5 && img.naturalWidth - needed > 150) {
+					if (bytes) wastedBytes += Math.round(bytes * (1 - 1 / (ratio * ratio)))
+					groups.oversized.push({
+						label,
+						detail: `${img.naturalWidth}×${img.naturalHeight} natural, shown at ${Math.round(rect.width)}×${Math.round(rect.height)} CSS px (about ${needed}px wide needed at ${dpr}x)${bytes ? `, ${Math.round(bytes / 1024)} KB` : ""}`,
+						tone: ratio > 3 ? "bad" : "warn",
+						selector,
+					})
+				}
+			}
+			const belowFold = rect.top > viewH
+			if (rendered && belowFold && img.loading !== "lazy") {
+				groups.lazy.push({ label, detail: `Below the fold (${Math.round(rect.top)}px down) without loading="lazy"`, tone: "warn", selector })
+			}
+			if (rendered && !belowFold && img.loading === "lazy" && rect.width * rect.height > 60000) {
+				groups.eager.push({ label, detail: "Large image above the fold is lazy loaded, this delays LCP", tone: "warn", selector })
+			}
+			if (/\.(jpe?g|png|gif|bmp)(\?|#|$)/i.test(src) && (bytes > 100 * 1024 || img.naturalWidth * img.naturalHeight > 640 * 480)) {
+				groups.legacy.push({ label, detail: `${src.match(/\.(jpe?g|png|gif|bmp)/i)[1].toUpperCase()}${bytes ? ` ${Math.round(bytes / 1024)} KB` : ""}, WebP or AVIF is usually 25 to 50% smaller`, tone: "info", selector })
+			}
+		}, { limit: 2000, ms: 300 })
+
+		const cap = (list) => list.slice(0, 40)
+		const sections = [
+			{ title: "Broken images", items: cap(groups.broken) },
+			{ title: "Missing alt text", items: cap(groups.alt) },
+			{ title: "Layout shift risk (no dimensions)", items: cap(groups.dims) },
+			{ title: "Oversized for their rendered size", items: cap(groups.oversized) },
+			{ title: "Lazy loading", items: cap([...groups.eager, ...groups.lazy]) },
+			{ title: "Legacy formats", items: cap(groups.legacy) },
+		]
+		const issues = Object.values(groups).reduce((sum, list) => sum + list.length, 0)
+		const summary = [
+			{ label: "Images", value: scan.truncated ? `${total}+` : total, tone: "info" },
+			{ label: "Issues", value: issues, tone: groups.broken.length || groups.alt.length ? "bad" : issues ? "warn" : "good" },
+			{ label: "Oversized", value: groups.oversized.length, tone: groups.oversized.length ? "warn" : "good" },
+			{ label: "No dimensions", value: groups.dims.length, tone: groups.dims.length ? "warn" : "good" },
+		]
+		if (wastedBytes > 1024) summary.push({ label: "Est. savings", value: `${Math.round(wastedBytes / 1024)} KB`, tone: "warn" })
+		if (!issues) sections.push({ title: "Result", items: [{ label: "All clear", detail: `${total} images checked, no issues found`, tone: "good" }] })
+		return report(summary, sections)
+	}
+
+	function a11ySummaryRows(result) {
+		const s = result.summary ?? {}
+		return [
+			{ label: "Total issues", value: result.total, tone: result.total ? "warn" : "good" },
+			{ label: "Critical", value: s.critical ?? 0, tone: s.critical ? "bad" : "good" },
+			{ label: "Serious", value: s.serious ?? 0, tone: s.serious ? "bad" : "good" },
+			{ label: "Moderate", value: s.moderate ?? 0, tone: s.moderate ? "warn" : "good" },
+			{ label: "Minor", value: s.minor ?? 0, tone: "info" },
+		]
+	}
+
 	function stopAllActiveTools() {
 		if (state.inspect) setInspect(false)
 		if (state.grid) toggleGrid()
@@ -5359,6 +5963,7 @@
 		if (state.edit) toggleEdit()
 		if (state.viewport) toggleViewport()
 		if (state.deviceFrame) toggleDeviceFrame({ close: true })
+		if (state.measure) toggleMeasure(false)
 		if (eyedropperActive) stopInPageEyedropper()
 		if (deepInspectPending) {
 			deepInspectPending = false
@@ -5369,6 +5974,7 @@
 		}
 		stopFormFiller()
 		cleanupSnipOverlay()
+		for (const name of [...activeCleanups.keys()]) runCleanup(name)
 		hideHud()
 		hideFloatingCta()
 		return { ok: true, data: "All active tools closed" }
@@ -5404,6 +6010,8 @@
 				edit: !!state.edit,
 				grid: !!state.grid,
 				outline: !!state.outline,
+				measure: !!state.measure,
+				eyedropper: !!eyedropperActive,
 			},
 		}),
 		eyedropper: () => openEyeDropper(),
@@ -5412,15 +6020,23 @@
 			stopInPageEyedropper()
 			return { ok: true }
 		},
-		"audit-a11y": () => ({ ok: true, data: auditA11y() }),
+		"audit-a11y": (payload) => {
+			const data = auditA11y()
+			if (payload?.source) showReportHud("Accessibility audit", a11ySummaryRows(data), JSON.stringify(data, null, 2))
+			return { ok: true, data }
+		},
 		"audit-seo": () => ({ ok: true, data: auditSeo() }),
-		"scan-links": async () => ({ ok: true, data: await scanLinks() }),
-		metrics: () => ({ ok: true, data: metrics() }),
+		"scan-links": async (payload) => ({ ok: true, data: await scanLinks(payload) }),
+		metrics: async () => ({ ok: true, data: await metrics() }),
 		storage: () => ({ ok: true, data: storageDump() }),
 		"storage-clear": (payload) => {
 			const store = payload?.store || "all"
-			if (store === "localStorage" || store === "all") localStorage.clear()
-			if (store === "sessionStorage" || store === "all") sessionStorage.clear()
+			try {
+				if (store === "localStorage" || store === "all") localStorage.clear()
+				if (store === "sessionStorage" || store === "all") sessionStorage.clear()
+			} catch (err) {
+				return { ok: false, error: err?.message ?? String(err) }
+			}
 			return { ok: true, data: storageDump() }
 		},
 		"storage-remove-key": (payload) => {
@@ -5440,13 +6056,22 @@
 		"console-log": () => ({ ok: true, data: getRecentLogs(100) }),
 		zindex: () => ({ ok: true, data: zIndexScan() }),
 		stack: () => ({ ok: true, data: detectStack() }),
-		"capture-context": () => ({ ok: true, data: pageContext() }),
+		"capture-context": (payload) => {
+			const data = pageContext()
+			if (payload?.source) {
+				const text = Object.entries(data).map(([key, value]) => `${key}: ${value}`).join("\n")
+				showHud("Bug context", text, "Copy", () => copy(text))
+			}
+			return { ok: true, data }
+		},
 		"deep-inspect": () => ({ ok: true, data: { enabled: setInspect() } }),
 		"scan-animations": () => ({ ok: true, data: scanAnimations() }),
-		"scan-events": () => ({ ok: true, data: scanEventListeners() }),
 		"fill-form": (payload) => fillForm(payload),
 		snip: (payload) => handleSnip(payload),
 		"stop-tool": () => stopAllActiveTools(),
+		"toggle-measure": () => ({ ok: true, data: { enabled: toggleMeasure() } }),
+		"security-check": async () => ({ ok: true, data: await securityCheck() }),
+		"image-audit": () => ({ ok: true, data: imageAudit() }),
 		"hide-hud": () => {
 			hideHud()
 			return { ok: true }
@@ -5454,7 +6079,8 @@
 		"highlight-element": (payload) => highlightElement(payload),
 	}
 
-	runtime.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+	const onRuntimeMessage = (message, _sender, sendResponse) => {
+		if (window[CORE_KEY] !== core) return false
 		const handler = handlers[message?.type]
 		if (!handler) {
 			sendResponse({ ok: false, error: `Unknown command: ${message?.type}` })
@@ -5472,5 +6098,24 @@
 			sendResponse({ ok: false, error: error?.message ?? String(error) })
 			return false
 		}
-	})
+	}
+	runtime.runtime.onMessage.addListener(onRuntimeMessage)
+
+	core.teardown = () => {
+		try {
+			stopAllActiveTools()
+		} catch {}
+		try {
+			runtime.runtime.onMessage.removeListener(onRuntimeMessage)
+		} catch {}
+		for (const fn of coreTeardowns.splice(0)) {
+			try {
+				fn()
+			} catch {}
+		}
+		shadowHost?.remove()
+		shadowHost = null
+		shadowRoot = null
+		if (window[CORE_KEY] === core) delete window[CORE_KEY]
+	}
 })()

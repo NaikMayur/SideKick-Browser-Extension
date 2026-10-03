@@ -1,57 +1,159 @@
-import { ToolError, pick, required, safeJsonParse, seededRandom } from "../lib/utils.js"
+import { ToolError, pick, required, seededRandom } from "../lib/utils.js"
+import { parseJsonWithDiagnostics } from "./text.js"
+
+const TABLE_ROW_LIMIT = 1000
+const DELIMITERS = [",", ";", "\t", "|"]
+
+export function resolveDelimiter(delimiter, sample = "") {
+	const value = String(delimiter ?? "")
+	if (value === "\\t" || value.toLowerCase() === "tab") return "\t"
+	if (value && value !== "auto") return value
+	return detectDelimiter(sample)
+}
+
+// Counts candidates outside quotes on the first lines and prefers the one that appears consistently.
+export function detectDelimiter(text) {
+	const lines = String(text).replace(/^\uFEFF/, "").split(/\r?\n/).filter((l) => l.trim()).slice(0, 10)
+	let best = ","
+	let bestScore = 0
+	for (const candidate of DELIMITERS) {
+		const counts = lines.map((line) => line.replace(/"[^"]*"/g, "").split(candidate).length - 1)
+		const first = counts[0] ?? 0
+		if (!first) continue
+		const consistent = counts.filter((c) => c === first).length
+		const score = consistent * 1000 + first
+		if (score > bestScore) {
+			best = candidate
+			bestScore = score
+		}
+	}
+	return best
+}
 
 export function parseCsv(text, delimiter = ",") {
+	const input = String(text).replace(/^\uFEFF/, "")
+	const sep = resolveDelimiter(delimiter, input)
 	const rows = []
 	let row = []
 	let field = ""
 	let inQuotes = false
-	const input = String(text).replace(/\r\n/g, "\n")
+	let quoteLine = 0
+	let line = 1
 	for (let i = 0; i < input.length; i += 1) {
 		const char = input[i]
 		if (inQuotes) {
-			if (char === '"') {
-				if (input[i + 1] === '"') {
-					field += '"'
+			if (char === "\"") {
+				if (input[i + 1] === "\"") {
+					field += "\""
 					i += 1
 				} else inQuotes = false
-			} else field += char
+			} else if (char === "\r" && input[i + 1] === "\n") {
+				field += "\n"
+				line += 1
+				i += 1
+			} else {
+				if (char === "\n") line += 1
+				field += char
+			}
 			continue
 		}
-		if (char === '"') inQuotes = true
-		else if (char === delimiter) {
+		// A quote only opens a quoted field at the start of a field, so ab"c stays literal.
+		if (char === "\"" && field.trim() === "") {
+			inQuotes = true
+			quoteLine = line
+			field = ""
+		} else if (input.startsWith(sep, i)) {
 			row.push(field)
 			field = ""
-		} else if (char === "\n") {
+			i += sep.length - 1
+		} else if (char === "\n" || char === "\r") {
+			if (char === "\r" && input[i + 1] === "\n") i += 1
 			row.push(field)
 			rows.push(row)
 			row = []
 			field = ""
+			line += 1
 		} else field += char
 	}
-	if (inQuotes) throw new ToolError("Unterminated quoted field in CSV")
+	if (inQuotes) throw new ToolError(`Unterminated quoted field starting on line ${quoteLine}`)
 	row.push(field)
 	rows.push(row)
 	return rows.filter((r) => r.length > 1 || r[0] !== "")
 }
 
-export function csvToJson(text, delimiter = ",") {
+export function inferValue(cell) {
+	if (cell === "") return null
+	if (cell === "true" || cell === "false") return cell === "true"
+	if (/^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$/.test(cell)) {
+		const num = Number(cell)
+		if (Number.isFinite(num) && (!/^-?\d+$/.test(cell) || Number.isSafeInteger(num))) return num
+	}
+	return cell
+}
+
+export function uniqueHeaders(header, width) {
+	const seen = new Map()
+	return Array.from({ length: Math.max(header.length, width) }, (_, index) => {
+		const base = String(header[index] ?? "").trim() || `column_${index + 1}`
+		const count = seen.get(base) ?? 0
+		seen.set(base, count + 1)
+		return count ? `${base}_${count + 1}` : base
+	})
+}
+
+function tableFromCsv(text, delimiter) {
 	const rows = parseCsv(text, delimiter)
-	if (!rows.length) return []
+	if (!rows.length) return { columns: [], body: [] }
 	const [header, ...body] = rows
+	const width = body.reduce((max, r) => Math.max(max, r.length), header.length)
+	return { columns: uniqueHeaders(header, width), body }
+}
+
+export function csvToJson(text, delimiter = ",", { inferTypes = false } = {}) {
+	const { columns, body } = tableFromCsv(text, delimiter)
 	return body.map((cells) =>
-		Object.fromEntries(header.map((key, index) => [key.trim() || `column_${index + 1}`, cells[index] ?? ""])),
+		Object.fromEntries(columns.map((key, index) => {
+			const cell = cells[index] ?? ""
+			return [key, inferTypes ? inferValue(cell) : cell]
+		})),
 	)
 }
 
-export function jsonToCsv(value, delimiter = ",") {
-	const list = Array.isArray(value) ? value : [value]
+export function flattenObject(value, prefix = "", out = {}) {
+	for (const [key, child] of Object.entries(value)) {
+		const path = prefix ? `${prefix}.${key}` : key
+		if (child && typeof child === "object" && !Array.isArray(child) && Object.keys(child).length) flattenObject(child, path, out)
+		else out[path] = child
+	}
+	return out
+}
+
+export function jsonToCsv(value, delimiter = ",", { flatten = true } = {}) {
+	const sep = resolveDelimiter(delimiter === "auto" ? "," : delimiter)
+	const list = (Array.isArray(value) ? value : [value]).map((item) => {
+		if (item === null || typeof item !== "object" || Array.isArray(item)) return { value: item }
+		return flatten ? flattenObject(item) : item
+	})
 	if (!list.length) return ""
-	const keys = [...new Set(list.flatMap((item) => Object.keys(item ?? {})))]
+	const keys = [...new Set(list.flatMap((item) => Object.keys(item)))]
 	const escape = (cell) => {
 		const text = cell === null || cell === undefined ? "" : typeof cell === "object" ? JSON.stringify(cell) : String(cell)
-		return /["\n\r]|,/.test(text) || text.includes(delimiter) ? `"${text.replace(/"/g, '""')}"` : text
+		return text.includes(sep) || /["\n\r]|^\s|\s$/.test(text) ? `"${text.replace(/"/g, "\"\"")}"` : text
 	}
-	return [keys.join(delimiter), ...list.map((item) => keys.map((key) => escape(item?.[key])).join(delimiter))].join("\n")
+	return [keys.map(escape).join(sep), ...list.map((item) => keys.map((key) => escape(item[key])).join(sep))].join("\n")
+}
+
+function csvTableResult(text, delimiter) {
+	const { columns, body } = tableFromCsv(text, delimiter)
+	const rows = body.slice(0, TABLE_ROW_LIMIT).map((cells) => columns.map((_, i) => cells[i] ?? ""))
+	if (body.length > TABLE_ROW_LIMIT) {
+		rows.push([`… ${body.length - TABLE_ROW_LIMIT} more rows not shown (Save downloads all rows as JSON)`, ...Array(Math.max(columns.length - 1, 0)).fill("")])
+	}
+	return {
+		type: "table",
+		value: { columns, rows },
+		download: { filename: "data.json", mime: "application/json", text: JSON.stringify(csvToJson(text, delimiter), null, 2) },
+	}
 }
 
 export function parseQueryString(url) {
@@ -73,27 +175,77 @@ export function parseQueryString(url) {
 		const key = safeDecode(rawKey).trim()
 		if (!key) continue
 		const val = safeDecode(rest.join("="))
-		if (key in params) params[key] = [].concat(params[key], val)
-		else params[key] = val
+		if (Object.hasOwn(params, key)) params[key] = [].concat(params[key], val)
+		else Object.defineProperty(params, key, { value: val, enumerable: true, writable: true, configurable: true })
 	}
 	return params
 }
 
-const FIRST = ["Ava", "Noah", "Mia", "Liam", "Zoe", "Kai", "Iris", "Omar", "Lena", "Ravi"]
-const LAST = ["Patel", "Kim", "Silva", "Okafor", "Novak", "Haddad", "Rossi", "Nguyen", "Weber", "Sharma"]
+const TRACKING = /^(utm_\w+|gclid|gbraid|wbraid|fbclid|msclkid|dclid|yclid|mc_cid|mc_eid|_hsenc|_hsmi|igshid|ref_src|si)$/i
+
+export function inspectUrl(input) {
+	const value = required(input, "URL").trim()
+	let parsed = null
+	let note = null
+	try {
+		parsed = new URL(value)
+	} catch {
+		if (/^[\w-]+(\.[\w-]+)+(:\d+)?([/?#]|$)/.test(value)) {
+			try {
+				parsed = new URL(`https://${value}`)
+				note = "No scheme given; assumed https://"
+			} catch {
+				parsed = null
+			}
+		}
+	}
+	if (!parsed) return { params: parseQueryString(value), note: "Not an absolute URL" }
+	const params = parseQueryString(parsed.search)
+	const result = {
+		protocol: parsed.protocol,
+		host: parsed.host,
+		pathname: parsed.pathname,
+		hash: parsed.hash,
+		params,
+		origin: parsed.origin,
+		hostname: parsed.hostname,
+		port: parsed.port || null,
+		search: parsed.search,
+		pathSegments: parsed.pathname.split("/").filter(Boolean).map((s) => {
+			try {
+				return decodeURIComponent(s)
+			} catch {
+				return s
+			}
+		}),
+		tracking: Object.keys(params).filter((key) => TRACKING.test(key)),
+	}
+	if (parsed.username) result.username = parsed.username
+	if (parsed.password) result.passwordPresent = true
+	if (parsed.hash.includes("=")) result.hashParams = parseQueryString(parsed.hash.slice(1))
+	if (note) result.note = note
+	return result
+}
+
+const FIRST = ["Ava", "Noah", "Mia", "Liam", "Zoe", "Kai", "Iris", "Omar", "Lena", "Ravi", "Sofía", "Jürgen", "Aiko", "Chloé"]
+const LAST = ["Patel", "Kim", "Silva", "Okafor", "Novak", "Haddad", "Rossi", "Nguyen", "Weber", "Sharma", "O'Brien", "García"]
 const DOMAINS = ["example.com", "test.dev", "mail.local", "acme.io"]
-const CITIES = ["Pune", "Berlin", "Austin", "Lisbon", "Toronto", "Osaka"]
+const CITIES = ["Pune", "Berlin", "Austin", "Lisbon", "Toronto", "Osaka", "São Paulo", "Tallinn"]
+
+function emailPart(text) {
+	return text.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase().replace(/[^a-z0-9]/g, "")
+}
 
 export function mockRecords({ count = 10, seed = "devkit" } = {}) {
 	const random = seededRandom(seed)
-	const total = Math.min(Math.max(Number(count) || 10, 1), 500)
+	const total = Math.min(Math.max(Math.floor(Number(count)) || 10, 1), 500)
 	return Array.from({ length: total }, (_, index) => {
 		const first = pick(random, FIRST)
 		const last = pick(random, LAST)
 		return {
 			id: index + 1,
 			name: `${first} ${last}`,
-			email: `${first.toLowerCase()}.${last.toLowerCase()}@${pick(random, DOMAINS)}`,
+			email: `${emailPart(first)}.${emailPart(last)}${index + 1}@${pick(random, DOMAINS)}`,
 			phone: `+1-555-${String(Math.floor(random() * 9000) + 1000)}`,
 			city: pick(random, CITIES),
 			age: 18 + Math.floor(random() * 50),
@@ -103,15 +255,86 @@ export function mockRecords({ count = 10, seed = "devkit" } = {}) {
 	})
 }
 
-export function buildCurl({ method = "GET", url, headers = "", body = "" }) {
-	const target = required(url, "URL")
-	const lines = [`curl -X ${String(method).toUpperCase()} '${target}'`]
-	for (const line of String(headers).split("\n").map((l) => l.trim()).filter(Boolean)) {
-		lines.push(`  -H '${line}'`)
+export function shellQuote(value) {
+	return `'${String(value).replace(/'/g, "'\\''")}'`
+}
+
+function psQuote(value) {
+	return `'${String(value).replace(/'/g, "''")}'`
+}
+
+export function parseHeaderLines(headers) {
+	return String(headers ?? "")
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean)
+		.map((line) => {
+			const index = line.indexOf(":")
+			return index > 0 ? [line.slice(0, index).trim(), line.slice(index + 1).trim()] : null
+		})
+		.filter(Boolean)
+}
+
+function requestParts({ method = "GET", url, headers = "", body = "" }) {
+	return {
+		method: String(method || "GET").toUpperCase(),
+		url: required(url, "URL").trim(),
+		headers: parseHeaderLines(headers),
+		body: String(body ?? "").trim() ? String(body) : "",
 	}
-	if (String(body).trim()) lines.push(`  -d '${String(body).replace(/'/g, "'\\''")}'`)
+}
+
+export function buildCurl(values) {
+	const req = requestParts(values)
+	const first = ["curl"]
+	if (req.method === "HEAD") first.push("--head")
+	else if (req.method !== "GET" || req.body) first.push("-X", req.method)
+	first.push(shellQuote(req.url))
+	const lines = [first.join(" ")]
+	for (const [key, val] of req.headers) lines.push(`  -H ${shellQuote(`${key}: ${val}`)}`)
+	// Using the data raw flag keeps a body that starts with @ from being read as a file name.
+	if (req.body) lines.push(`  --data-raw ${shellQuote(req.body)}`)
 	return lines.join(" \\\n")
 }
+
+function buildFetch(req) {
+	const init = { method: req.method, headers: Object.fromEntries(req.headers) }
+	if (req.body) init.body = req.body
+	return `await fetch(${JSON.stringify(req.url)}, ${JSON.stringify(init, null, 2)})`
+}
+
+function buildPython(req) {
+	const args = [JSON.stringify(req.method), JSON.stringify(req.url)]
+	if (req.headers.length) args.push(`headers=${JSON.stringify(Object.fromEntries(req.headers))}`)
+	if (req.body) args.push(`data=${JSON.stringify(req.body)}`)
+	return `import requests\n\nresponse = requests.request(${args.join(", ")})\nprint(response.status_code, response.text)`
+}
+
+function buildPowerShell(req) {
+	const parts = [`Invoke-RestMethod -Method ${req.method[0]}${req.method.slice(1).toLowerCase()} -Uri ${psQuote(req.url)}`]
+	const headers = req.headers.filter(([key]) => key.toLowerCase() !== "content-type")
+	const contentType = req.headers.find(([key]) => key.toLowerCase() === "content-type")
+	if (headers.length) parts.push(`-Headers @{ ${headers.map(([k, v]) => `${psQuote(k)} = ${psQuote(v)}`).join("; ")} }`)
+	if (contentType) parts.push(`-ContentType ${psQuote(contentType[1])}`)
+	if (req.body) parts.push(`-Body ${psQuote(req.body)}`)
+	return parts.join(" `\n  ")
+}
+
+export function buildSnippets(values, target = "curl-fetch") {
+	const req = requestParts(values)
+	const builders = {
+		curl: () => buildCurl(values),
+		fetch: () => buildFetch(req),
+		python: () => buildPython(req),
+		powershell: () => buildPowerShell(req),
+	}
+	if (target === "curl-fetch") return `${builders.curl()}\n\n${builders.fetch()}`
+	const build = builders[target]
+	if (!build) throw new ToolError(`Unknown target: ${target}`)
+	return build()
+}
+
+const DATA_ACCEPT = ".csv,.tsv,.json,.txt,text/*,application/json"
 
 export const dataTools = [
 	{
@@ -119,17 +342,47 @@ export const dataTools = [
 		name: "CSV ↔ JSON converter",
 		category: "Text & data",
 		roles: ["dev", "qa", "it"],
-		description: "Quote-aware conversion in both directions for fixtures and bug attachments.",
+		description: "Quote aware CSV/TSV ⇄ JSON conversion with delimiter detection, type inference and a table preview.",
+		keywords: ["csv", "tsv", "excel", "spreadsheet", "convert", "table", "json to csv", "preview"],
+		live: true,
 		inputs: [
-			{ key: "text", label: "Input", type: "textarea" },
-			{ key: "mode", label: "Direction", type: "select", options: ["csv-to-json", "json-to-csv"], default: "csv-to-json" },
-			{ key: "delimiter", label: "Delimiter", type: "text", default: "," },
+			{ key: "text", label: "Input", type: "textarea", upload: { accept: DATA_ACCEPT } },
+			{
+				key: "mode",
+				label: "Direction",
+				type: "select",
+				options: [
+					{ value: "csv-to-json", label: "CSV → JSON" },
+					{ value: "json-to-csv", label: "JSON → CSV" },
+					{ value: "csv-table", label: "CSV → table preview" },
+				],
+				default: "csv-to-json",
+			},
+			{
+				key: "delimiter",
+				label: "Delimiter",
+				type: "select",
+				options: [
+					{ value: "auto", label: "Auto detect" },
+					{ value: ",", label: "Comma (,)" },
+					{ value: ";", label: "Semicolon (;)" },
+					{ value: "\t", label: "Tab" },
+					{ value: "|", label: "Pipe (|)" },
+				],
+				default: "auto",
+				help: "JSON → CSV uses a comma when set to auto.",
+			},
+			{ key: "inferTypes", label: "Convert numbers, booleans and empty cells", type: "checkbox", default: false, showIf: { key: "mode", in: ["csv-to-json"] } },
+			{ key: "flatten", label: "Flatten nested objects (a.b columns)", type: "checkbox", default: true, showIf: { key: "mode", in: ["json-to-csv"] } },
 		],
-		run: ({ text, mode = "csv-to-json", delimiter = "," }) => {
+		run: ({ text, mode = "csv-to-json", delimiter = "auto", inferTypes = false, flatten = true }) => {
 			const value = required(text, "Input")
-			const sep = delimiter || ","
-			if (mode === "json-to-csv") return { type: "text", value: jsonToCsv(safeJsonParse(value), sep) }
-			return { type: "json", value: csvToJson(value, sep) }
+			if (mode === "json-to-csv") {
+				const csv = jsonToCsv(parseJsonWithDiagnostics(value), delimiter, { flatten })
+				return { type: "text", value: csv, download: { filename: "data.csv", mime: "text/csv", text: csv } }
+			}
+			if (mode === "csv-table") return csvTableResult(value, delimiter)
+			return { type: "json", value: csvToJson(value, delimiter, { inferTypes }) }
 		},
 	},
 	{
@@ -137,42 +390,32 @@ export const dataTools = [
 		name: "URL & query inspector",
 		category: "Text & data",
 		roles: ["dev", "qa"],
-		description: "Break a URL into protocol, host, path, params and hash — great for tracking-link QA.",
+		description: "Break a URL into protocol, host, path, params and hash, and flag tracking parameters.",
+		keywords: ["url", "query", "params", "utm", "tracking", "parse url", "querystring"],
+		live: true,
 		inputs: [{ key: "url", label: "URL", type: "textarea", placeholder: "https://site.com/a?b=1&utm_source=x" }],
-		run: ({ url }) => {
-			const value = required(url, "URL").trim()
-			let parsed = null
-			try {
-				parsed = new URL(value)
-			} catch {
-				return { type: "json", value: { params: parseQueryString(value), note: "Not an absolute URL" } }
-			}
-			return {
-				type: "json",
-				value: {
-					protocol: parsed.protocol,
-					host: parsed.host,
-					pathname: parsed.pathname,
-					hash: parsed.hash,
-					params: parseQueryString(parsed.search),
-				},
-			}
-		},
+		run: ({ url }) => ({ type: "json", value: inspectUrl(url) }),
 	},
 	{
 		id: "mock-data",
 		name: "Mock data generator",
 		category: "Testing",
 		roles: ["qa", "dev"],
-		description: "Deterministic, seedable fake users as JSON or CSV so test runs stay reproducible.",
+		description: "Deterministic, seedable fake users as JSON, CSV or a table so test runs stay reproducible.",
+		keywords: ["fake", "fixtures", "seed", "test data", "dummy users", "faker"],
+		live: true,
 		inputs: [
-			{ key: "count", label: "Rows", type: "number", default: 10 },
-			{ key: "seed", label: "Seed", type: "text", default: "devkit" },
-			{ key: "format", label: "Format", type: "select", options: ["json", "csv"], default: "json" },
+			{ key: "count", label: "Rows", type: "number", default: 10, min: 1, max: 500 },
+			{ key: "seed", label: "Seed", type: "text", default: "devkit", help: "The same seed always produces the same rows." },
+			{ key: "format", label: "Format", type: "select", options: [{ value: "json", label: "JSON" }, { value: "csv", label: "CSV" }, { value: "table", label: "Table" }], default: "json" },
 		],
 		run: ({ count = 10, seed = "devkit", format = "json" }) => {
 			const records = mockRecords({ count, seed })
-			if (format === "csv") return { type: "text", value: jsonToCsv(records) }
+			if (format === "csv") return { type: "text", value: jsonToCsv(records), download: { filename: "mock-data.csv", mime: "text/csv", text: jsonToCsv(records) } }
+			if (format === "table") {
+				const columns = Object.keys(records[0])
+				return { type: "table", value: { columns, rows: records.map((r) => columns.map((c) => r[c])) } }
+			}
 			return { type: "json", value: records }
 		},
 	},
@@ -181,217 +424,186 @@ export const dataTools = [
 		name: "cURL / fetch builder",
 		category: "API",
 		roles: ["dev", "qa"],
-		description: "Turn a request definition into a copy-pasteable cURL command and fetch() snippet.",
+		description: "Turn a request definition into safely quoted cURL, fetch(), Python requests or PowerShell snippets.",
+		keywords: ["curl", "fetch", "http request", "api", "python requests", "powershell", "invoke-restmethod", "snippet"],
+		live: true,
 		inputs: [
-			{ key: "method", label: "Method", type: "select", options: ["GET", "POST", "PUT", "PATCH", "DELETE"], default: "GET" },
+			{ key: "method", label: "Method", type: "select", options: ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"], default: "GET" },
 			{ key: "url", label: "URL", type: "text", placeholder: "https://api.example.com/v1/users" },
-			{ key: "headers", label: "Headers (one per line)", type: "textarea", placeholder: "Content-Type: application/json" },
+			{ key: "headers", label: "Headers (one per line)", type: "textarea", placeholder: "Content-Type: application/json", help: "Name: value per line; lines without a colon are ignored." },
 			{ key: "body", label: "Body", type: "textarea" },
+			{
+				key: "target",
+				label: "Output",
+				type: "select",
+				options: [
+					{ value: "curl-fetch", label: "cURL + fetch" },
+					{ value: "curl", label: "cURL (bash, zsh, Git Bash)" },
+					{ value: "fetch", label: "JavaScript fetch" },
+					{ value: "python", label: "Python requests" },
+					{ value: "powershell", label: "PowerShell" },
+				],
+				default: "curl-fetch",
+			},
 		],
-		run: (values) => {
-			const curl = buildCurl(values)
-			const headerObject = Object.fromEntries(
-				String(values.headers ?? "")
-					.split("\n")
-					.map((line) => line.split(/:(.*)/s))
-					.filter((parts) => parts.length > 1 && parts[0].trim())
-					.map(([key, val]) => [key.trim(), val.trim()]),
-			)
-			const fetchSnippet = `await fetch(${JSON.stringify(values.url ?? "")}, ${JSON.stringify(
-				{
-					method: String(values.method ?? "GET").toUpperCase(),
-					headers: headerObject,
-					...(String(values.body ?? "").trim() ? { body: String(values.body) } : {}),
-				},
-				null,
-				2,
-			)})`
-			return { type: "text", value: `${curl}\n\n${fetchSnippet}` }
-		},
+		run: (values) => ({ type: "text", value: buildSnippets(values, values.target ?? "curl-fetch") }),
 	},
 	{
 		id: "json-to-ts",
 		name: "JSON to TypeScript",
 		category: "Text & data",
 		roles: ["dev"],
-		description: "Generate clean TypeScript interfaces, type aliases, and enums or unions from JSON.",
+		description: "Generate TypeScript interfaces or type aliases from sample JSON, merging array items and detecting string unions.",
+		keywords: ["typescript", "interface", "types", "ts", "codegen", "schema", "quicktype"],
+		live: true,
 		inputs: [
-			{ key: "json", label: "JSON input", type: "textarea", default: '{\n  "id": 1,\n  "name": "Alex"\n}', placeholder: '{\n  "id": 1,\n  "name": "Alex"\n}' },
-			{ key: "rootName", label: "Root interface name", type: "text", default: "Root" },
-			{ key: "declaration", label: "Declaration style", type: "select", options: ["interface", "type"], default: "interface" },
-			{ key: "enums", label: "Enum detection", type: "select", options: ["unions", "enum", "none"], default: "unions" },
+			{ key: "json", label: "JSON input", type: "textarea", default: "{\n  \"id\": 1,\n  \"name\": \"Alex\"\n}", placeholder: "{\n  \"id\": 1,\n  \"name\": \"Alex\"\n}", upload: { accept: ".json,application/json,text/*" } },
+			{ key: "rootName", label: "Root type name", type: "text", default: "Root" },
+			{ key: "declaration", label: "Declaration style", type: "select", options: [{ value: "interface", label: "interface" }, { value: "type", label: "type alias" }], default: "interface" },
+			{
+				key: "enums",
+				label: "Repeated string values",
+				type: "select",
+				options: [
+					{ value: "unions", label: "String literal unions" },
+					{ value: "enum", label: "enum declarations" },
+					{ value: "none", label: "Plain string" },
+				],
+				default: "unions",
+				help: "Only fields whose values repeat across samples become unions.",
+			},
 		],
 		run: (values) => {
-			const jsonVal = values.json ?? values.text
-			const value = required(jsonVal, "JSON input")
+			const value = required(values.json ?? values.text, "JSON input")
 			const code = jsonToTypeScript(value, {
-				rootName: values.rootName ?? "Root",
+				rootName: values.rootName || "Root",
 				declaration: values.declaration ?? "interface",
 				enums: values.enums ?? "unions",
 			})
-			return { type: "text", value: code }
+			return { type: "text", value: code, download: { filename: `${values.rootName || "Root"}.ts`, mime: "text/plain", text: code } }
 		},
 	},
 ]
 
-export function jsonToTypeScript(input, { rootName = "Root", declaration = "interface", enums = "unions" } = {}) {
-	if (!input || !String(input).trim()) {
-		throw new ToolError("JSON input is required")
-	}
-	let data
-	try {
-		data = typeof input === "string" ? JSON.parse(input) : input
-	} catch (e) {
-		throw new ToolError(`Invalid JSON: ${e.message}`)
-	}
+function pascalName(name) {
+	const clean = String(name)
+		.replace(/[^a-zA-Z0-9_$]/g, " ")
+		.trim()
+		.split(/\s+/)
+		.map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+		.join("")
+	const candidate = clean || "Type"
+	return /^[0-9]/.test(candidate) ? `T${candidate}` : candidate
+}
 
+function singular(name) {
+	if (/ies$/i.test(name)) return name.replace(/ies$/i, "y")
+	if (/(ss|us)$/i.test(name)) return name
+	if (/s$/i.test(name) && name.length > 3) return name.slice(0, -1)
+	return `${name}Item`
+}
+
+function isPlainObject(value) {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+export function jsonToTypeScript(input, { rootName = "Root", declaration = "interface", enums = "unions" } = {}) {
+	if (input === undefined || input === null || !String(input).trim()) throw new ToolError("JSON input is required")
+	const data = typeof input === "string" ? parseJsonWithDiagnostics(input) : input
+	const usedNames = new Set()
 	const definitions = []
 	const enumDefs = []
-	const usedNames = new Set()
+	const unionByKey = new Map()
 
-	function sanitizeName(name) {
-		const clean = name
-			.replace(/[^a-zA-Z0-9_$]/g, " ")
-			.trim()
-			.split(/\s+/)
-			.map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-			.join("")
-		let candidate = clean || "Type"
-		if (/^[0-9]/.test(candidate)) candidate = `T${candidate}`
-		let unique = candidate
-		let counter = 1
-		while (usedNames.has(unique)) {
-			unique = `${candidate}${counter++}`
-		}
+	const uniqueName = (name) => {
+		const base = pascalName(name)
+		let unique = base
+		let counter = 2
+		while (usedNames.has(unique)) unique = `${base}${counter++}`
 		usedNames.add(unique)
 		return unique
 	}
+	const formatKey = (key) => (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key) ? key : JSON.stringify(key))
 
-	function formatKey(key) {
-		return /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key) ? key : JSON.stringify(key)
+	// A string field becomes a union only when its values repeat, so free text like names stays string.
+	const stringUnion = (key, values) => {
+		if (enums === "none" || !key) return null
+		const distinct = [...new Set(values)]
+		if (distinct.length < 2 || distinct.length > 12 || values.length <= distinct.length) return null
+		if (distinct.some((v) => v.length > 40 || /\s{2,}|^\d{4}-\d\d-\d\d/.test(v))) return null
+		const signature = distinct.slice().sort().join("\u0000")
+		const known = unionByKey.get(key)
+		if (known && known.signature === signature) return known.name
+		const name = uniqueName(key)
+		unionByKey.set(key, { name, signature })
+		if (enums === "enum") {
+			const memberNames = new Set()
+			const members = distinct.map((val) => {
+				let member = pascalName(val.replace(/[^a-zA-Z0-9_$]+/g, " ")) || "Value"
+				if (/^[0-9]/.test(member)) member = `_${member}`
+				let candidate = member
+				let n = 2
+				while (memberNames.has(candidate)) candidate = `${member}${n++}`
+				memberNames.add(candidate)
+				return `\t${candidate} = ${JSON.stringify(val)},`
+			})
+			enumDefs.push(`export enum ${name} {\n${members.join("\n")}\n}`)
+		} else enumDefs.push(`export type ${name} = ${distinct.map((v) => JSON.stringify(v)).join(" | ")};`)
+		return name
 	}
 
-	const stringFrequencies = new Map()
-	function collectStringStats(obj) {
-		if (Array.isArray(obj)) {
-			for (const item of obj) collectStringStats(item)
-		} else if (obj && typeof obj === "object") {
-			for (const [k, v] of Object.entries(obj)) {
-				if (typeof v === "string") {
-					if (!stringFrequencies.has(k)) stringFrequencies.set(k, new Set())
-					stringFrequencies.get(k).add(v)
-				} else if (typeof v === "object") {
-					collectStringStats(v)
-				}
+	const typeOfValues = (values, key, nameHint) => {
+		const types = []
+		const add = (t) => {
+			if (!types.includes(t)) types.push(t)
+		}
+		const strings = values.filter((v) => typeof v === "string")
+		const objects = values.filter(isPlainObject)
+		const arrays = values.filter(Array.isArray)
+		if (strings.length) add(stringUnion(key, strings) ?? "string")
+		for (const v of values) {
+			if (typeof v === "number" || typeof v === "boolean") add(typeof v)
+		}
+		if (objects.length) add(defineObject(objects, nameHint))
+		if (arrays.length) {
+			const items = arrays.flat()
+			if (!items.length) add("unknown[]")
+			else {
+				const inner = typeOfValues(items, key, singular(nameHint))
+				add(inner.includes(" | ") ? `(${inner})[]` : `${inner}[]`)
 			}
 		}
-	}
-	collectStringStats(data)
-
-	const enumTypes = new Map()
-	if (enums !== "none") {
-		for (const [k, vals] of stringFrequencies.entries()) {
-			if (vals.size >= 2 && vals.size <= 12) {
-				const enumName = sanitizeName(k)
-				if (enums === "enum") {
-					const members = [...vals]
-						.map((val) => {
-							const memberKey = val.replace(/[^a-zA-Z0-9_$]/g, "_") || "Value"
-							const memberPascal = memberKey.charAt(0).toUpperCase() + memberKey.slice(1)
-							return `\t${memberPascal} = ${JSON.stringify(val)},`
-						})
-						.join("\n")
-					enumDefs.push(`export enum ${enumName} {\n${members}\n}`)
-				} else {
-					const unionStr = [...vals].map((v) => JSON.stringify(v)).join(" | ")
-					enumDefs.push(`export type ${enumName} = ${unionStr};`)
-				}
-				enumTypes.set(k, enumName)
-			}
-		}
+		if (values.some((v) => v === null)) add("null")
+		return types.length ? types.join(" | ") : "unknown"
 	}
 
-	function resolveType(val, parentKey = "") {
-		if (val === null) return "null"
-		if (val === undefined) return "unknown"
-		const t = typeof val
-		if (t === "boolean" || t === "number") return t
-		if (t === "string") {
-			if (enumTypes.has(parentKey)) return enumTypes.get(parentKey)
-			return "string"
-		}
-		if (Array.isArray(val)) {
-			if (!val.length) return "any[]"
-			const elementTypes = new Set()
-			const objectItems = []
-			for (const item of val) {
-				if (item !== null && typeof item === "object" && !Array.isArray(item)) {
-					objectItems.push(item)
-				} else {
-					elementTypes.add(resolveType(item, parentKey))
-				}
-			}
-			if (objectItems.length) {
-				const itemTypeName = sanitizeName(`${parentKey}Item` || "Item")
-				generateObjectDefinition(objectItems, itemTypeName)
-				elementTypes.add(itemTypeName)
-			}
-			const joined = [...elementTypes].join(" | ")
-			return elementTypes.size > 1 ? `(${joined})[]` : `${joined}[]`
-		}
-		if (typeof val === "object") {
-			const nestedName = sanitizeName(parentKey || "Nested")
-			generateObjectDefinition([val], nestedName)
-			return nestedName
-		}
-		return "unknown"
-	}
-
-	function generateObjectDefinition(sampleObjects, typeName) {
-		const keyMap = new Map()
-		const total = sampleObjects.length
-
-		for (const obj of sampleObjects) {
-			for (const [k, v] of Object.entries(obj)) {
-				if (!keyMap.has(k)) {
-					keyMap.set(k, { types: new Set(), count: 0 })
-				}
-				const entry = keyMap.get(k)
-				entry.count++
-				entry.types.add(resolveType(v, k))
+	const defineObject = (samples, nameHint) => {
+		const name = uniqueName(nameHint)
+		const keys = new Map()
+		for (const sample of samples) {
+			for (const [key, value] of Object.entries(sample)) {
+				if (!keys.has(key)) keys.set(key, [])
+				keys.get(key).push(value)
 			}
 		}
-
 		const lines = []
-		for (const [key, { types, count }] of keyMap.entries()) {
-			const optional = count < total ? "?" : ""
-			const typeStr = types.size > 0 ? [...types].join(" | ") : "any"
-			lines.push(`\t${formatKey(key)}${optional}: ${typeStr};`)
+		const slot = definitions.length
+		definitions.push(null)
+		for (const [key, values] of keys) {
+			const optional = values.length < samples.length ? "?" : ""
+			lines.push(`\t${formatKey(key)}${optional}: ${typeOfValues(values, key, key)};`)
 		}
-
-		if (declaration === "type") {
-			definitions.push(`export type ${typeName} = {\n${lines.join("\n")}\n};`)
-		} else {
-			definitions.push(`export interface ${typeName} {\n${lines.join("\n")}\n}`)
-		}
+		definitions[slot] = declaration === "type" ? `export type ${name} = {\n${lines.join("\n")}\n};` : `export interface ${name} {\n${lines.join("\n")}\n}`
+		return name
 	}
 
-	const cleanRootName = sanitizeName(rootName || "Root")
-	if (Array.isArray(data)) {
-		if (data.length && typeof data[0] === "object" && data[0] !== null) {
-			const itemTypeName = sanitizeName(`${cleanRootName}Item`)
-			generateObjectDefinition(data, itemTypeName)
-			definitions.unshift(`export type ${cleanRootName} = ${itemTypeName}[];`)
-		} else {
-			const elemType = data.length ? resolveType(data[0], cleanRootName) : "any"
-			definitions.unshift(`export type ${cleanRootName} = ${elemType}[];`)
-		}
-	} else if (typeof data === "object" && data !== null) {
-		generateObjectDefinition([data], cleanRootName)
-	} else {
-		definitions.unshift(`export type ${cleanRootName} = ${data === null ? "null" : typeof data};`)
+	const root = pascalName(rootName || "Root")
+	if (isPlainObject(data)) defineObject([data], root)
+	else {
+		usedNames.add(root)
+		const slot = definitions.length
+		definitions.push(null)
+		definitions[slot] = `export type ${root} = ${typeOfValues([data], "", root)};`
 	}
-
-	const all = [...enumDefs, ...definitions]
-	return all.join("\n\n")
+	return [...enumDefs, ...definitions].join("\n\n")
 }

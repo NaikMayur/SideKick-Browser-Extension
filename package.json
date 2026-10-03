@@ -1,7 +1,7 @@
 {
   "name": "sidekick",
   "version": "1.0.0",
-  "description": "Sidekick is a browser companion with 45 tools for developers, QA testers, UI and UX designers. Zero runtime dependencies.",
+  "description": "Sidekick is an offline browser toolkit for developers, QA testers and designers. Zero runtime dependencies.",
   "type": "module",
   "private": true,
   "scripts": {

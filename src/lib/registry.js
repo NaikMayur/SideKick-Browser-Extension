@@ -1,6 +1,7 @@
 import { dataTools } from "../tools/data.js"
 import { designTools } from "../tools/design.js"
 import { encodingTools } from "../tools/encoding.js"
+import { formatTools } from "../tools/formats.js"
 import { imageTools } from "../tools/image.js"
 import { pageTools } from "../tools/page-actions.js"
 import { testingTools } from "../tools/testing.js"
@@ -9,60 +10,68 @@ import { timeTools } from "../tools/time.js"
 import { ToolError } from "./utils.js"
 
 export const TOOL_PRIORITY = [
-	"image-converter",
-	"snipping-tool",
 	"inspect-element",
-	"edit-mode",
-	"form-filler",
-	"eyedropper",
+	"snipping-tool",
 	"json-format",
-	"text-diff",
-	"jwt-decode",
-	"color-report",
-	"contrast-checker",
-	"tech-stack",
-	"seo-audit",
+	"image-converter",
+	"console-capture",
 	"a11y-audit",
 	"page-metrics",
-	"link-check",
-	"grid-overlay",
-	"outline-all",
-	"viewport-resize",
-	"storage-inspector",
-	"console-capture",
-	"font-report",
+	"text-diff",
+	"jwt-decode",
 	"base64",
-	"url-encode",
-	"uuid",
-	"secret-generator",
-	"hash",
-	"json-to-ts",
-	"csv-json",
-	"query-string",
-	"curl-builder",
+	"eyedropper",
+	"contrast-checker",
 	"color-convert",
-	"palette",
-	"unit-convert",
-	"type-scale",
-	"shadow-generator",
-	"animation-scanner",
-	"event-listener-map",
-	"zindex-scan",
+	"viewport-resize",
+	"link-check",
+	"security-check",
 	"regex-tester",
-	"case-converter",
-	"word-count",
-	"slugify",
-	"mock-data",
-	"perf-budget",
+	"text-escape",
 	"timestamp",
-	"timezone",
+	"hash",
+	"json-yaml",
+	"seo-audit",
+	"image-audit",
+	"measure",
+	"csv-json",
+	"json-query",
+	"code-format",
+	"curl-builder",
+	"storage-inspector",
+	"tech-stack",
+	"form-filler",
+	"edit-mode",
+	"query-string",
+	"uuid",
+	"qr-code",
+	"svg-optimize",
+	"color-report",
+	"font-report",
+	"palette",
+	"json-to-ts",
+	"secret-generator",
 	"cron",
-	"duration",
+	"timezone",
 	"bug-report",
-	"test-matrix",
-	"gherkin",
+	"markdown-preview",
+	"case-converter",
+	"unit-convert",
+	"shadow-generator",
+	"image-palette",
+	"user-agent",
+	"line-tools",
+	"word-count",
+	"mock-data",
+	"type-scale",
+	"outline-all",
+	"grid-overlay",
 	"http-status",
-	"html-entities",
+	"number-base",
+	"perf-budget",
+	"zindex-scan",
+	"duration",
+	"animation-scanner",
 	"lorem",
 ]
 
@@ -71,6 +80,7 @@ const allTools = [
 	...pageTools,
 	...encodingTools,
 	...textTools,
+	...formatTools,
 	...dataTools,
 	...designTools,
 	...timeTools,
@@ -101,15 +111,44 @@ export function getTool(id) {
 	return tool
 }
 
+const searchText = new Map()
+
+function haystackFor(tool) {
+	let text = searchText.get(tool.id)
+	if (!text) {
+		text = [tool.name, tool.id, tool.category, tool.description, ...(tool.roles ?? []), ...(tool.keywords ?? [])].join(" ").toLowerCase()
+		searchText.set(tool.id, text)
+	}
+	return text
+}
+
+function searchScore(tool, parts) {
+	const name = `${tool.name} ${tool.id}`.toLowerCase()
+	let score = 0
+	for (const part of parts) {
+		if (name.startsWith(part)) score += 3
+		else if (name.includes(part)) score += 2
+		else if ((tool.keywords ?? []).some((word) => word.toLowerCase().includes(part))) score += 1
+	}
+	return score
+}
+
 export function searchTools(query, role = "all") {
-	const term = String(query ?? "").trim().toLowerCase()
-	return tools.filter((tool) => {
-		const roleOk = role === "all" || (tool.roles ?? []).includes(role)
-		if (!roleOk) return false
-		if (!term) return true
-		const haystack = `${tool.name} ${tool.description} ${tool.category} ${(tool.roles ?? []).join(" ")} ${tool.id}`.toLowerCase()
-		return term.split(/\s+/).every((part) => haystack.includes(part))
+	const parts = String(query ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean)
+	const matches = tools.filter((tool) => {
+		if (role !== "all" && !(tool.roles ?? []).includes(role)) return false
+		if (!parts.length) return true
+		const haystack = haystackFor(tool)
+		return parts.every((part) => haystack.includes(part))
 	})
+	if (!parts.length) return matches
+	const scored = matches.map((tool, index) => ({ tool, index, score: searchScore(tool, parts) }))
+	scored.sort((a, b) => b.score - a.score || a.index - b.index)
+	return scored.map((entry) => entry.tool)
+}
+
+export function optionValue(option) {
+	return option && typeof option === "object" ? String(option.value) : String(option)
 }
 
 export function coerceValues(tool, rawValues = {}) {
@@ -118,11 +157,23 @@ export function coerceValues(tool, rawValues = {}) {
 		const raw = rawValues[input.key]
 		const fallback = input.default
 		if (input.type === "number") {
-			const parsed = raw === "" || raw === undefined || raw === null ? fallback : Number(raw)
+			const empty = raw === "" || raw === undefined || raw === null
+			let parsed = empty ? fallback : Number(raw)
 			if (parsed !== undefined && Number.isNaN(Number(parsed))) throw new ToolError(`${input.label} must be a number`)
+			if (parsed !== undefined) {
+				parsed = Number(parsed)
+				if (typeof input.min === "number") parsed = Math.max(input.min, parsed)
+				if (typeof input.max === "number") parsed = Math.min(input.max, parsed)
+			}
 			values[input.key] = parsed
 		} else if (input.type === "checkbox") {
 			values[input.key] = raw === undefined ? Boolean(fallback) : Boolean(raw)
+		} else if (input.type === "file") {
+			values[input.key] = raw && typeof raw === "object" ? raw : null
+		} else if (input.type === "select" && input.options?.length) {
+			const allowed = input.options.map(optionValue)
+			const value = raw === undefined || raw === "" ? fallback : raw
+			values[input.key] = allowed.includes(String(value)) ? String(value) : String(fallback ?? allowed[0])
 		} else {
 			values[input.key] = raw === undefined || raw === "" ? fallback ?? "" : raw
 		}

@@ -65,7 +65,10 @@ export const api = {
 		sendMessage: (tabId, message) => call("tabs.sendMessage", tabId, message),
 		create: (info) => call("tabs.create", info),
 		update: (tabId, info) => call("tabs.update", tabId, info),
-		captureVisibleTab: (opts) => (opts !== undefined ? call("tabs.captureVisibleTab", opts) : call("tabs.captureVisibleTab")),
+		captureVisibleTab: (windowIdOrOpts, opts) =>
+			typeof windowIdOrOpts === "number"
+				? call("tabs.captureVisibleTab", windowIdOrOpts, opts ?? {})
+				: call("tabs.captureVisibleTab", windowIdOrOpts ?? {}),
 	},
 	runtime: {
 		sendMessage: (message) => call("runtime.sendMessage", message),
@@ -75,6 +78,7 @@ export const api = {
 	},
 	scripting: {
 		executeScript: (details) => call("scripting.executeScript", details),
+		insertCSS: (details) => call("scripting.insertCSS", details),
 	},
 	cookies: {
 		getAll: (details) => call("cookies.getAll", details),
@@ -114,7 +118,7 @@ export async function activeTab() {
 
 const RESTRICTED_PATTERNS = /^(chrome|chrome-extension|edge|about|brave|opera|vivaldi|moz-extension|file):\/\//
 
-function isRestrictedUrl(url) {
+export function isRestrictedUrl(url) {
 	if (!url) return true
 	if (RESTRICTED_PATTERNS.test(url)) return true
 	if (url.includes("chromewebstore.google.com")) return true
@@ -123,58 +127,74 @@ function isRestrictedUrl(url) {
 	return false
 }
 
-async function injectContentScript(tabId) {
+// Injected on demand when a page tool is used. The only content script declared in the
+// manifests is the small main world console buffer.
+export const PAGE_INJECTION = Object.freeze({
+	js: Object.freeze(["content/content.js"]),
+	css: Object.freeze(["content/overlay.css"]),
+})
+
+export function isNoReceiverError(error) {
+	const text = String(error?.message ?? error)
+	return text.includes("Receiving end does not exist") || text.includes("Could not establish connection")
+}
+
+export async function ensureInjected(tabId) {
 	try {
-		await api.scripting.executeScript({
-			target: { tabId },
-			files: ["content/content.js"],
-		})
-		return true
+		await api.scripting.executeScript({ target: { tabId }, files: [...PAGE_INJECTION.js] })
 	} catch {
 		return false
 	}
+	try {
+		await api.scripting.insertCSS({ target: { tabId }, files: [...PAGE_INJECTION.css] })
+	} catch {
+		// The overlay lives in a shadow root and the page stylesheet is cosmetic, so keep going.
+	}
+	return true
 }
 
-export async function sendToPage(message) {
-	const tab = await activeTab()
-	if (!tab?.id) return { ok: false, error: "No active tab" }
-
-	if (isRestrictedUrl(tab.url)) {
-		return {
-			ok: false,
-			error: "Sidekick cannot run on browser internal pages (chrome://, edge://, about:) or extension store pages. Open a regular website and try again.",
-		}
-	}
-
+// With inject false a missing receiver resolves quietly to { ok: false, error: "not-injected" },
+// so status queries never inject Sidekick into a page just because the popup opened.
+export async function sendToTab(tabId, message, { inject = true } = {}) {
 	try {
-		const response = await api.tabs.sendMessage(tab.id, message)
+		const response = await api.tabs.sendMessage(tabId, message)
 		return response ?? { ok: false, error: "No response from page" }
 	} catch (firstError) {
-		const isNoReceiver =
-			String(firstError?.message).includes("Receiving end does not exist") ||
-			String(firstError?.message).includes("Could not establish connection")
-
-		if (!isNoReceiver) {
-			return { ok: false, error: `Content script error: ${firstError.message}` }
+		if (!isNoReceiverError(firstError)) {
+			return { ok: false, error: `Content script error: ${firstError?.message ?? firstError}` }
 		}
-
-		const injected = await injectContentScript(tab.id)
-		if (!injected) {
+		if (!inject) return { ok: false, error: "not-injected" }
+		if (!(await ensureInjected(tabId))) {
 			return {
 				ok: false,
 				error: "Could not inject Sidekick into this page. It may be a restricted or protected page.",
 			}
 		}
+		for (const wait of [60, 200]) {
+			await new Promise((resolve) => setTimeout(resolve, wait))
+			try {
+				const response = await api.tabs.sendMessage(tabId, message)
+				return response ?? { ok: false, error: "No response from page" }
+			} catch (retryError) {
+				if (wait === 200) return { ok: false, error: `Page not reachable after injection: ${retryError?.message ?? retryError}` }
+			}
+		}
+		return { ok: false, error: "Page not reachable after injection" }
+	}
+}
 
-		await new Promise((resolve) => setTimeout(resolve, 150))
+export async function sendToPage(message, { inject = true } = {}) {
+	const tab = await activeTab()
+	if (!tab?.id) return { ok: false, error: "No active tab" }
 
-		try {
-			const response = await api.tabs.sendMessage(tab.id, message)
-			return response ?? { ok: false, error: "No response from page" }
-		} catch (retryError) {
-			return { ok: false, error: `Page not reachable after injection: ${retryError.message}` }
+	if (isRestrictedUrl(tab.url)) {
+		if (!inject) return { ok: false, error: "restricted" }
+		return {
+			ok: false,
+			error: "Sidekick cannot run on browser internal pages (chrome://, edge://, about:) or extension store pages. Open a regular website and try again.",
 		}
 	}
+	return sendToTab(tab.id, message, { inject })
 }
 
 export async function resizeCurrentWindow(width, height) {

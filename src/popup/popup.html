@@ -1,70 +1,117 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="color-scheme" content="dark light" />
 		<title>Sidekick</title>
+		<script src="mode.js"></script>
+		<link rel="icon" type="image/svg+xml" href="../assets/logo.svg" />
 		<link rel="stylesheet" href="popup.css" />
 	</head>
-	<body>
-		<header class="bar">
+	<body class="app">
+		<header class="topbar">
 			<div class="brand">
-				<span class="dot" aria-hidden="true"></span>
+				<span class="brand-mark" aria-hidden="true"><svg class="i"><use href="../assets/icons.svg#i-logo" /></svg></span>
 				<h1>Sidekick</h1>
+				<span id="tool-total" class="brand-count mono"></span>
 			</div>
-			<div class="bar-actions">
-				<select id="role" aria-label="Filter tools by role"></select>
-				<button id="theme" class="icon-btn" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
-				<button id="popout" class="icon-btn" type="button" title="Pop out into separate window (won't close when testing full page)" aria-label="Pop out into separate window">↗</button>
+			<div class="topbar-actions">
+				<label class="role-select">
+					<span class="visually-hidden">Filter tools by role</span>
+					<select id="role" class="select-chip"></select>
+				</label>
+				<button id="theme" class="icon-btn" type="button" title="Theme: system" aria-label="Theme: system">
+					<svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-monitor" /></svg>
+				</button>
+				<button id="popout" class="icon-btn" type="button" title="Open in a separate window" aria-label="Open in a separate window">
+					<svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-external" /></svg>
+				</button>
+				<button id="options-link" class="icon-btn" type="button" title="Settings" aria-label="Settings">
+					<svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-settings" /></svg>
+				</button>
 			</div>
 		</header>
 
-		<div class="search-row">
-			<div class="search-wrapper">
-				<span class="search-icon" aria-hidden="true">⌕</span>
-				<input id="search" type="search" placeholder="Search 55+ tools… (↑ ↓ to move, Enter to open)" autocomplete="off" aria-label="Search tools" />
-				<span class="search-shortcut" aria-hidden="true">↑ ↓</span>
+		<section id="list-view" class="view">
+			<div class="search">
+				<svg class="i search-icon" aria-hidden="true"><use href="../assets/icons.svg#i-search" /></svg>
+				<input
+					id="search"
+					type="search"
+					placeholder="Search tools"
+					autocomplete="off"
+					spellcheck="false"
+					role="combobox"
+					aria-label="Search tools"
+					aria-controls="list"
+					aria-expanded="true"
+					aria-autocomplete="list"
+				/>
+				<kbd class="search-kbd" aria-hidden="true">/</kbd>
 			</div>
-		</div>
+			<div class="tabs" role="tablist" aria-label="Tool groups">
+				<button class="tab" type="button" role="tab" data-tab="all" aria-selected="true">All <span class="tab-count mono"></span></button>
+				<button class="tab" type="button" role="tab" data-tab="page" aria-selected="false">On this page <span class="tab-count mono"></span></button>
+				<button class="tab" type="button" role="tab" data-tab="utils" aria-selected="false">Utilities <span class="tab-count mono"></span></button>
+			</div>
+			<main id="list-scroll" class="scroll">
+				<nav id="recent" class="recent" aria-label="Recently used" hidden></nav>
+				<div id="list" class="tool-list" role="listbox" aria-label="Tools"></div>
+				<div id="empty" class="empty" hidden></div>
+			</main>
+		</section>
 
-		<div class="filter-tabs" role="tablist" aria-label="Tool classification">
-			<button id="tab-all" class="tab-btn active" type="button" role="tab" aria-selected="true">All (55)</button>
-			<button id="tab-workflows" class="tab-btn" type="button" role="tab" aria-selected="false">★ Core Workflows</button>
-			<button id="tab-page" class="tab-btn" type="button" role="tab" aria-selected="false">Active Tab</button>
-			<button id="tab-utils" class="tab-btn" type="button" role="tab" aria-selected="false">Utilities</button>
-		</div>
-
-		<main id="main">
-			<section id="list-view">
-				<div id="list" role="listbox" aria-label="Tools"></div>
-				<p id="empty" class="empty" hidden>No tool matches that search.</p>
-			</section>
-
-			<section id="detail-view" hidden>
-				<div class="detail-header-bar">
-					<button id="back" class="detail-back-btn" type="button">← All tools</button>
-					<button id="close-tool" class="detail-close-btn" type="button" title="Close opened tool">✕ Close Tool</button>
+		<section id="detail-view" class="view" hidden>
+			<div class="tool-head">
+				<button id="back" class="icon-btn" type="button" title="Back to all tools (Esc)" aria-label="Back to all tools">
+					<svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-back" /></svg>
+				</button>
+				<span id="tool-icon" class="tile lg" aria-hidden="true"></span>
+				<div class="tool-head-text">
+					<h2 id="tool-name"></h2>
+					<span id="tool-category" class="cat mono"></span>
 				</div>
-				<h2 id="tool-name"></h2>
-				<p id="tool-desc" class="muted"></p>
-				<form id="form" novalidate></form>
-				<div class="row">
-					<button id="run" class="primary" type="button">Run</button>
-					<button id="copy" type="button">Copy</button>
-					<button id="download" type="button">Save</button>
-					<button id="pin" type="button">Pin</button>
+				<button id="pin" class="icon-btn" type="button" aria-pressed="false" title="Pin to top" aria-label="Pin to top">
+					<svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-pin" /></svg>
+				</button>
+			</div>
+			<main id="detail-scroll" class="scroll detail-body">
+				<p id="tool-desc" class="tool-desc"></p>
+				<form id="form" class="form" novalidate></form>
+				<div class="form-meta">
+					<span id="live-badge" class="live-badge mono" hidden>Live</span>
+					<button id="reset" class="link-btn" type="button">Reset to defaults</button>
 				</div>
-				<p id="error" class="error" role="alert" hidden></p>
-				<div id="rich-output" class="rich-output" hidden></div>
-				<pre id="output" tabindex="0" aria-live="polite"></pre>
-			</section>
-		</main>
+				<div id="result" class="result-area" aria-live="polite"></div>
+			</main>
+			<div class="actionbar">
+				<button id="run" class="btn primary" type="button">
+					<svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-play" /></svg>
+					<span class="btn-label">Run</span>
+					<kbd class="btn-kbd" aria-hidden="true">Ctrl ↵</kbd>
+				</button>
+				<button id="stop" class="btn ghost danger" type="button" hidden title="Remove this tool's overlays from the page">
+					<svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-stop" /></svg>
+					<span class="btn-label">Stop</span>
+				</button>
+				<span class="spacer"></span>
+				<button id="copy" class="icon-btn" type="button" title="Copy result" aria-label="Copy result" disabled>
+					<svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-copy" /></svg>
+				</button>
+				<button id="download" class="icon-btn" type="button" title="Save result to a file" aria-label="Save result to a file" disabled>
+					<svg class="i" aria-hidden="true"><use href="../assets/icons.svg#i-download" /></svg>
+				</button>
+			</div>
+		</section>
 
-		<footer class="bar footer">
-			<span id="status">Ready</span>
-			<a id="options-link" href="#">Settings &amp; docs</a>
+		<footer class="statusbar">
+			<span id="status-dot" class="status-dot" aria-hidden="true"></span>
+			<span id="status" class="status" role="status" aria-live="polite">Ready</span>
+			<span class="status-keys mono" aria-hidden="true"><kbd>/</kbd> search <kbd>↑↓</kbd> move <kbd>↵</kbd> open</span>
 		</footer>
 
+		<div id="toast" class="toast" role="status" aria-live="polite"></div>
 		<script type="module" src="popup.js"></script>
 	</body>
 </html>

@@ -1,4 +1,4 @@
-import { api, isExtension } from "../lib/browser.js"
+import { api, isExtension, isRestrictedUrl, sendToTab } from "../lib/browser.js"
 
 const MENU_ITEMS = [
 	{ id: "sidekick-inspect", title: "Sidekick: inspect element", command: "toggle-inspect" },
@@ -41,25 +41,181 @@ async function pushHistory(entry) {
 	return next
 }
 
-async function relayToActiveTab(command, payload = {}) {
-	const tabs = await api.tabs.query({ active: true, currentWindow: true })
-	const tab = tabs?.[0]
-	if (!tab?.id) return { ok: false, error: "No active tab" }
-	try {
-		return (await api.tabs.sendMessage(tab.id, { type: command, payload })) ?? { ok: true }
-	} catch (firstError) {
-		const msg = String(firstError?.message)
-		if (msg.includes("Receiving end") || msg.includes("Could not establish connection")) {
+async function relayToActiveTab(command, payload = {}, tabId = null) {
+	let id = tabId
+	if (!id) {
+		const tabs = await api.tabs.query({ active: true, currentWindow: true })
+		const tab = tabs?.[0]
+		if (!tab?.id) return { ok: false, error: "No active tab" }
+		if (isRestrictedUrl(tab.url)) return { ok: false, error: "Sidekick cannot run on this page" }
+		id = tab.id
+	}
+	return (await sendToTab(id, { type: command, payload })) ?? { ok: true }
+}
+
+// captureVisibleTab is rate limited (about 2 calls per second on Chromium); every capture is queued here.
+const CAPTURE_GAP_MS = 550
+let captureQueue = Promise.resolve()
+let lastCaptureAt = 0
+
+function captureTab(windowId) {
+	const run = async () => {
+		for (let attempt = 0; attempt < 4; attempt++) {
+			const wait = lastCaptureAt + CAPTURE_GAP_MS - Date.now()
+			if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait))
+			lastCaptureAt = Date.now()
 			try {
-				await api.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/content.js"] })
-				await new Promise((r) => setTimeout(r, 150))
-				return (await api.tabs.sendMessage(tab.id, { type: command, payload })) ?? { ok: true }
-			} catch (retryError) {
-				return { ok: false, error: `Page not reachable: ${retryError.message}` }
+				return await api.tabs.captureVisibleTab(typeof windowId === "number" ? windowId : undefined, { format: "png" })
+			} catch (error) {
+				if (!/MAX_CAPTURE|quota|rate/i.test(String(error?.message)) || attempt === 3) throw error
+				await new Promise((resolve) => setTimeout(resolve, 600 * (attempt + 1)))
 			}
 		}
-		return { ok: false, error: `Page not reachable: ${firstError.message}` }
+		throw new Error("Screenshot failed")
 	}
+	const next = captureQueue.then(run, run)
+	captureQueue = next.catch(() => {})
+	return next
+}
+
+const LINK_LIMIT = 300
+const LINK_CONCURRENCY = 6
+const LINK_TIMEOUT_MS = 8000
+
+async function timedFetch(url, init, timeoutMs = LINK_TIMEOUT_MS) {
+	const controller = new AbortController()
+	const timer = setTimeout(() => controller.abort(), timeoutMs)
+	try {
+		return await fetch(url, { ...init, signal: controller.signal, cache: "no-store", redirect: "follow" })
+	} finally {
+		clearTimeout(timer)
+	}
+}
+
+async function discardBody(res) {
+	try {
+		await res.body?.cancel()
+	} catch {}
+}
+
+function linkResult(url, res, method, started) {
+	return {
+		url,
+		ok: res.ok,
+		status: res.status,
+		statusText: res.statusText,
+		redirected: res.redirected,
+		finalUrl: res.redirected ? res.url : undefined,
+		method,
+		ms: Date.now() - started,
+	}
+}
+
+async function checkOneLink(url, pageOrigin) {
+	let origin = ""
+	try {
+		const parsed = new URL(url)
+		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return { url, ok: null, status: null, error: "unsupported scheme" }
+		origin = parsed.origin
+	} catch {
+		return { url, ok: false, status: null, error: "invalid URL" }
+	}
+	// Only send cookies to the page's own origin.
+	const credentials = origin === pageOrigin ? "include" : "omit"
+	const started = Date.now()
+	try {
+		const head = await timedFetch(url, { method: "HEAD", credentials })
+		if (![400, 403, 405, 501].includes(head.status)) return linkResult(url, head, "HEAD", started)
+	} catch (error) {
+		if (error?.name === "AbortError") return { url, ok: false, status: null, error: "timeout", method: "HEAD", ms: Date.now() - started }
+	}
+	try {
+		const res = await timedFetch(url, { method: "GET", credentials })
+		await discardBody(res)
+		return linkResult(url, res, "GET", started)
+	} catch (error) {
+		return {
+			url,
+			ok: false,
+			status: null,
+			error: error?.name === "AbortError" ? "timeout" : String(error?.message ?? error),
+			method: "GET",
+			ms: Date.now() - started,
+		}
+	}
+}
+
+async function checkLinks(urls, pageUrl) {
+	let pageOrigin = ""
+	try {
+		pageOrigin = new URL(pageUrl).origin
+	} catch {}
+	const list = Array.isArray(urls) ? urls.filter((u) => typeof u === "string") : []
+	const unique = [...new Set(list)].slice(0, LINK_LIMIT)
+	const results = new Array(unique.length)
+	let cursor = 0
+	const worker = async () => {
+		while (cursor < unique.length) {
+			const index = cursor++
+			results[index] = await checkOneLink(unique[index], pageOrigin)
+		}
+	}
+	await Promise.all(Array.from({ length: Math.min(LINK_CONCURRENCY, unique.length) }, worker))
+	return { results, checked: unique.length, truncated: new Set(list).size > unique.length }
+}
+
+const SECURITY_HEADERS = [
+	"content-security-policy",
+	"content-security-policy-report-only",
+	"strict-transport-security",
+	"x-content-type-options",
+	"x-frame-options",
+	"referrer-policy",
+	"permissions-policy",
+	"cross-origin-opener-policy",
+	"cross-origin-embedder-policy",
+	"cross-origin-resource-policy",
+	"x-xss-protection",
+	"server",
+	"x-powered-by",
+	"access-control-allow-origin",
+]
+
+async function securityCheck(pageUrl) {
+	const out = { url: pageUrl ?? null, status: null, finalUrl: null, headers: {}, cookies: [], error: null }
+	let parsed
+	try {
+		parsed = new URL(pageUrl)
+	} catch {
+		return { ...out, error: "invalid URL" }
+	}
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return { ...out, error: "unsupported scheme" }
+	try {
+		const res = await timedFetch(pageUrl, { method: "GET", credentials: "include" }, 12000)
+		out.status = res.status
+		out.finalUrl = res.url
+		for (const name of SECURITY_HEADERS) {
+			const value = res.headers.get(name)
+			if (value !== null) out.headers[name] = value.slice(0, 4000)
+		}
+		await discardBody(res)
+	} catch (error) {
+		out.error = error?.name === "AbortError" ? "timeout" : String(error?.message ?? error)
+	}
+	try {
+		const cookies = await api.cookies.getAll({ url: pageUrl })
+		out.cookies = (cookies ?? []).slice(0, 200).map((c) => ({
+			name: c.name,
+			domain: c.domain,
+			path: c.path,
+			secure: Boolean(c.secure),
+			httpOnly: Boolean(c.httpOnly),
+			sameSite: c.sameSite ?? "unspecified",
+			session: Boolean(c.session),
+			hostOnly: Boolean(c.hostOnly),
+		}))
+	} catch {}
+	return out
 }
 
 if (isExtension) {
@@ -83,14 +239,14 @@ if (isExtension) {
 	api.contextMenus?.onClicked?.addListener(
 		safe((info) => {
 			const item = MENU_ITEMS.find((entry) => entry.id === info.menuItemId)
-			if (item) return relayToActiveTab(item.command)
+			if (item) return relayToActiveTab(item.command, { source: "menu" })
 			return undefined
 		}),
 	)
 
-	api.commands?.onCommand?.addListener(safe((command) => relayToActiveTab(command)))
+	api.commands?.onCommand?.addListener(safe((command) => relayToActiveTab(command, { source: "shortcut" })))
 
-	api.raw.runtime.onMessage?.addListener((message, _sender, sendResponse) => {
+	api.raw.runtime.onMessage?.addListener((message, sender, sendResponse) => {
 		;(async () => {
 			try {
 				switch (message?.type) {
@@ -98,14 +254,22 @@ if (isExtension) {
 						sendResponse({ ok: true, flavor: api.flavor, version: api.runtime.getManifest().version })
 						break
 					case "relay":
-						sendResponse(await relayToActiveTab(message.command, message.payload))
+						sendResponse(await relayToActiveTab(message.command, message.payload, message.tabId ?? null))
 						break
 					case "history:add":
 						sendResponse({ ok: true, history: await pushHistory(message.entry ?? {}) })
 						break
 					case "screenshot": {
-						const dataUrl = await api.tabs.captureVisibleTab({ format: "png" })
+						const dataUrl = await captureTab(sender?.tab?.windowId)
 						sendResponse({ ok: true, dataUrl })
+						break
+					}
+					case "links:check": {
+						sendResponse({ ok: true, ...(await checkLinks(message.urls, message.pageUrl ?? sender?.tab?.url ?? "")) })
+						break
+					}
+					case "security:check": {
+						sendResponse({ ok: true, data: await securityCheck(message.url ?? sender?.tab?.url) })
 						break
 					}
 					case "cookies:list": {
@@ -153,4 +317,4 @@ if (isExtension) {
 	)
 }
 
-export { relayToActiveTab, pushHistory }
+export { relayToActiveTab, pushHistory, checkLinks, securityCheck }
