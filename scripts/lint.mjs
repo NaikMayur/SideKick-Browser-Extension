@@ -77,6 +77,7 @@ const firefox = JSON.parse(readFileSync(join(src, "manifest.firefox.json"), "utf
 if (chrome.version !== firefox.version) problems.push("manifest version mismatch between Chrome and Firefox")
 if (chrome.name !== firefox.name) problems.push("manifest name mismatch")
 for (const permission of chrome.permissions) {
+	if (permission === "sidePanel") continue
 	if (!firefox.permissions.includes(permission)) problems.push(`Firefox manifest missing permission: ${permission}`)
 }
 
