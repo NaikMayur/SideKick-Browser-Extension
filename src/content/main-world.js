@@ -4,7 +4,7 @@
 // and CSP violations in a capped ring buffer. Probing page globals and framework bindings runs
 // only when the isolated script asks for it through DOM CustomEvents.
 ;(() => {
-	const KEY = Symbol.for("sidekick.mainWorld")
+	const KEY = Symbol("sidekick.mainWorld")
 	if (window[KEY]) return
 	try {
 		Object.defineProperty(window, KEY, { value: true })

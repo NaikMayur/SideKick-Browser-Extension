@@ -5525,20 +5525,61 @@
 		}
 	}
 
+	function findMainScroller() {
+        let best = null
+        let bestArea = 0
+        scanElements("body *", (node) => {
+            if (node.scrollHeight - node.clientHeight < 8 || node.clientHeight < 100) return
+            const overflowY = getComputedStyle(node).overflowY
+            if (overflowY !== "auto" && overflowY !== "scroll" && overflowY !== "overlay") return
+            const rect = node.getBoundingClientRect()
+            const w = Math.min(rect.right, window.innerWidth) - Math.max(rect.left, 0)
+            const h = Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0)
+            if (w <= 0 || h <= 0) return
+            if (w * h > bestArea) {
+                bestArea = w * h
+                best = node
+            }
+        }, { limit: 20000, ms: 400 })
+        return best
+    }
+
+
 	async function snipFullPage() {
 		const dpr = window.devicePixelRatio || 1
 		const viewW = window.innerWidth
 		const viewH = window.innerHeight
-		const fullH = Math.max(
+		const docH = Math.max(
 			document.body.scrollHeight,
 			document.documentElement.scrollHeight,
 			document.body.offsetHeight,
 			document.documentElement.offsetHeight
 		)
-		const fullW = Math.max(
-			document.body.scrollWidth,
-			document.documentElement.scrollWidth
-		)
+		const scroller = docH - viewH > 4 ? null : findMainScroller()
+
+        let clip, fullH, fullW, scrollToY, getY
+        if (scroller) {
+            const rect = scroller.getBoundingClientRect()
+            const left = Math.max(rect.left + scroller.clientLeft, 0)
+            const top = Math.max(rect.top + scroller.clientTop, 0)
+            const right = Math.min(rect.left + scroller.clientLeft + scroller.clientWidth, viewW)
+            const bottom = Math.min(rect.top + scroller.clientTop + scroller.clientHeight, viewH)
+            clip = { left, top, width: right - left, height: bottom - top }
+            fullH = scroller.scrollHeight
+            fullW = clip.width
+            scrollToY = (y) => { scroller.scrollTop = y }
+            getY = () => scroller.scrollTop
+        } else {
+            clip = { left: 0, top: 0, width: viewW, height: viewH }
+            fullH = docH
+            fullW = Math.max(
+                document.body.scrollWidth,
+                document.documentElement.scrollWidth
+            )
+            scrollToY = (y) => window.scrollTo({ left: 0, top: y, behavior: "instant" })
+            getY = () => window.scrollY
+        }
+
 		// Browsers cap canvas size (about 32k px per side), so very long pages are truncated.
 		const maxCssHeight = Math.floor(32000 / dpr)
 		const truncated = fullH > maxCssHeight
@@ -5546,6 +5587,7 @@
 
 		const savedX = window.scrollX
 		const savedY = window.scrollY
+		const savedScrollerY = scroller ? scroller.scrollTop : 0
 
 		let cancelled = false
 		function onKey(e) {
@@ -5564,13 +5606,15 @@
 		const fixedEls = []
 		scanElements("body *", (node) => {
 			const pos = getComputedStyle(node).position
-			if (pos === "fixed" || pos === "sticky") fixedEls.push({ node, orig: node.style.cssText })
-		}, { limit: 20000, ms: 400 })
+			if ((pos === "fixed" || pos === "sticky") && !(scroller && node.contains(scroller))) {
+                fixedEls.push({ node, orig: node.style.cssText })
+            }
+        }, { limit: 20000, ms: 400 })
 		const hideFixed = () => {
 			for (const { node } of fixedEls) node.style.setProperty("visibility", "hidden", "important")
 		}
 
-		const totalChunks = Math.ceil(captureH / viewH)
+		const totalChunks = Math.ceil(captureH / clip.height)
 		const canvas = document.createElement("canvas")
 		canvas.width = Math.round(fullW * dpr)
 		canvas.height = Math.round(captureH * dpr)
@@ -5605,22 +5649,25 @@
 				const img = await dataUrlToImageEl(dataUrl)
 				if (cancelled) break
 
-				const actualScrollY = window.scrollY
-				const yOffset = actualScrollY * dpr
-				const drawH = Math.min(viewH * dpr, canvas.height - yOffset)
+	                const yOffset = getY() * dpr
+                const drawH = Math.min(clip.height * dpr, canvas.height - yOffset)
+                const srcX = scroller ? Math.round(clip.left * dpr) : 0
+                const srcW = scroller ? canvas.width : img.width
 
-				ctx.drawImage(
-					img,
-					0, 0, img.width, Math.round(drawH),
-					0, Math.round(yOffset), img.width, Math.round(drawH)
-				)
-			}
-		} finally {
-			window.removeEventListener("keydown", onKey, true)
-			document.removeEventListener("keydown", onKey, true)
-			activeSnipCancel = null
 
-			window.scrollTo({ left: savedX, top: savedY, behavior: "instant" })
+                ctx.drawImage(
+                    img,
+                    srcX, Math.round(clip.top * dpr), srcW, Math.round(drawH),
+                    0, Math.round(yOffset), srcW, Math.round(drawH)
+                )
+            }
+        } finally {
+            window.removeEventListener("keydown", onKey, true)
+            document.removeEventListener("keydown", onKey, true)
+            activeSnipCancel = null
+
+            if (scroller) scroller.scrollTop = savedScrollerY
+            window.scrollTo({ left: savedX, top: savedY, behavior: "instant" })
 			for (const { node, orig } of fixedEls) {
 				node.style.cssText = orig
 			}

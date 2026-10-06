@@ -272,11 +272,6 @@ if (isExtension) {
 						sendResponse({ ok: true, data: await securityCheck(message.url ?? sender?.tab?.url) })
 						break
 					}
-					case "cookies:list": {
-						const cookies = await api.cookies.getAll({ url: message.url })
-						sendResponse({ ok: true, cookies })
-						break
-					}
 					case "open-sidepanel": {
 						try {
 							if (api.raw.sidePanel?.open) {
