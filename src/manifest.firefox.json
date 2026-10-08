@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Sidekick",
   "short_name": "Sidekick",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Offline toolkit for developers, testers and designers: inspect, audit, convert and report on any page, with zero tracking.",
   "browser_specific_settings": {
     "gecko": {
