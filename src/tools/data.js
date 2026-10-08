@@ -2,6 +2,8 @@ import { ToolError, required } from "../lib/utils.js"
 import { MOCK_TYPES, generateMockRecords, recordsToSql } from "./mock.js"
 import { parseJsonWithDiagnostics } from "./text.js"
 
+export { generateMockRecords, generateMockRecords as mockRecords } from "./mock.js"
+
 const TABLE_ROW_LIMIT = 1000
 const DELIMITERS = [",", ";", "\t", "|"]
 
