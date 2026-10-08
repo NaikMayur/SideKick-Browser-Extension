@@ -1,4 +1,5 @@
 import { api, isExtension, isRestrictedUrl, sendToTab } from "../lib/browser.js"
+import { vaultGet, vaultSet } from "../lib/vault.js"
 
 const MENU_ITEMS = [
 	{ id: "sidekick-inspect", title: "Sidekick: inspect element", command: "toggle-inspect" },
@@ -181,6 +182,97 @@ const SECURITY_HEADERS = [
 	"access-control-allow-origin",
 ]
 
+const CONTENT_VAULT = new Set(["ai-context"])
+const VAULT_MAX_CHARS = 8_000_000
+const SIGNAL_MAX_CHARS = 2_000_000
+
+async function readCapped(res, max = SIGNAL_MAX_CHARS) {
+	if (!res.body) return ""
+	const reader = res.body.getReader()
+	const decoder = new TextDecoder()
+	let text = ""
+	try {
+		while (text.length < max) {
+			const { done, value } = await reader.read()
+			if (done) break
+			text += decoder.decode(value, { stream: true })
+		}
+	} finally {
+		try {
+			await reader.cancel()
+		} catch {}
+	}
+	return text.slice(0, max)
+}
+
+async function fetchSignal(url, { maxChars = SIGNAL_MAX_CHARS, headers = [] } = {}) {
+	const out = { url, status: null, ok: false, contentType: "", headers: {}, text: "", error: null }
+	try {
+		const res = await timedFetch(url, { method: "GET", credentials: "omit", headers: { Accept: "text/html,text/plain,application/xml;q=0.9,*/*;q=0.8" } }, 12000)
+		out.status = res.status
+		out.ok = res.ok
+		out.finalUrl = res.url
+		out.contentType = res.headers.get("content-type") ?? ""
+		for (const name of headers) {
+			const value = res.headers.get(name)
+			if (value !== null) out.headers[name] = value.slice(0, 2000)
+		}
+		out.text = res.ok ? await readCapped(res, maxChars) : ""
+		if (!res.ok) await discardBody(res)
+	} catch (error) {
+		out.error = error?.name === "AbortError" ? "timeout" : String(error?.message ?? error)
+	}
+	return out
+}
+
+const TEXT_MAX_CHARS = 20_000_000
+
+async function fetchTextFor(url, tabUrl) {
+	let parsed
+	try {
+		parsed = new URL(url)
+	} catch {
+		return { ok: false, error: "invalid URL" }
+	}
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return { ok: false, error: "unsupported scheme" }
+	let sameSite = false
+	try {
+		sameSite = new URL(tabUrl).origin === parsed.origin
+	} catch {}
+	try {
+		const res = await timedFetch(parsed.href, { method: "GET", credentials: sameSite ? "include" : "omit" }, 15000)
+		if (!res.ok) {
+			await discardBody(res)
+			return { ok: false, status: res.status, error: `HTTP ${res.status}` }
+		}
+		return { ok: true, status: res.status, text: await readCapped(res, TEXT_MAX_CHARS) }
+	} catch (error) {
+		return { ok: false, error: error?.name === "AbortError" ? "timeout" : String(error?.message ?? error) }
+	}
+}
+
+async function fetchAiSignals(pageUrl, tabUrl) {
+	let page
+	let tab
+	try {
+		page = new URL(pageUrl)
+		tab = new URL(tabUrl ?? pageUrl)
+	} catch {
+		return { error: "invalid URL" }
+	}
+	if (!/^https?:$/.test(page.protocol)) return { error: "unsupported scheme" }
+	if (page.origin !== tab.origin) return { error: "Only the current site can be checked" }
+	const origin = page.origin
+	const [html, robots, llms, llmsFull, sitemap] = await Promise.all([
+		fetchSignal(page.href, { headers: ["x-robots-tag", "last-modified", "content-language", "link"] }),
+		fetchSignal(`${origin}/robots.txt`, { maxChars: 500_000 }),
+		fetchSignal(`${origin}/llms.txt`, { maxChars: 500_000 }),
+		fetchSignal(`${origin}/llms-full.txt`, { maxChars: 20_000 }),
+		fetchSignal(`${origin}/sitemap.xml`, { maxChars: 300_000 }),
+	])
+	return { origin, html, robots, llms, llmsFull, sitemap }
+}
+
 async function securityCheck(pageUrl) {
 	const out = { url: pageUrl ?? null, status: null, finalUrl: null, headers: {}, cookies: [], error: null }
 	let parsed
@@ -256,6 +348,38 @@ if (isExtension) {
 					case "relay":
 						sendResponse(await relayToActiveTab(message.command, message.payload, message.tabId ?? null))
 						break
+					case "vault:put": {
+						if (sender?.id !== api.raw.runtime.id || !CONTENT_VAULT.has(message.name)) {
+							sendResponse({ ok: false, error: "Not allowed" })
+							break
+						}
+						if (JSON.stringify(message.value ?? null).length > VAULT_MAX_CHARS) {
+							sendResponse({ ok: false, error: "Too large to store" })
+							break
+						}
+						await vaultSet(message.name, message.value)
+						sendResponse({ ok: true })
+						break
+					}
+					case "vault:get": {
+						if (sender?.id !== api.raw.runtime.id || !CONTENT_VAULT.has(message.name)) {
+							sendResponse({ ok: false, error: "Not allowed" })
+							break
+						}
+						sendResponse({ ok: true, value: await vaultGet(message.name) })
+						break
+					}
+					case "fetch-text": {
+						if (sender?.id !== api.raw.runtime.id) {
+							sendResponse({ ok: false, error: "Not allowed" })
+							break
+						}
+						sendResponse(await fetchTextFor(message.url, sender?.tab?.url))
+						break
+					}
+					case "ai-readiness:fetch":
+						sendResponse({ ok: true, data: await fetchAiSignals(message.url ?? sender?.tab?.url, sender?.tab?.url) })
+						break
 					case "history:add":
 						sendResponse({ ok: true, history: await pushHistory(message.entry ?? {}) })
 						break
@@ -270,6 +394,11 @@ if (isExtension) {
 					}
 					case "security:check": {
 						sendResponse({ ok: true, data: await securityCheck(message.url ?? sender?.tab?.url) })
+						break
+					}
+					case "cookies:list": {
+						const cookies = await api.cookies.getAll({ url: message.url })
+						sendResponse({ ok: true, cookies })
 						break
 					}
 					case "open-sidepanel": {
@@ -305,6 +434,7 @@ if (isExtension) {
 
 	api.raw.action?.onClicked?.addListener(
 		safe(async (tab) => {
+			if (api.raw.sidebarAction?.toggle) return api.raw.sidebarAction.toggle()
 			if (api.raw.sidePanel?.open && tab?.windowId) {
 				await api.raw.sidePanel.open({ windowId: tab.windowId })
 			}

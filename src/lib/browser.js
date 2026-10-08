@@ -60,6 +60,12 @@ export const api = {
 		remove: (keys) => call("storage.local.remove", keys),
 		clear: () => call("storage.local.clear"),
 	},
+	session: raw?.storage?.session && {
+		get: (keys) => call("storage.session.get", keys),
+		set: (items) => call("storage.session.set", items),
+		remove: (keys) => call("storage.session.remove", keys),
+		clear: () => call("storage.session.clear"),
+	},
 	tabs: {
 		query: (info) => call("tabs.query", info),
 		sendMessage: (tabId, message) => call("tabs.sendMessage", tabId, message),
@@ -130,7 +136,7 @@ export function isRestrictedUrl(url) {
 // Injected on demand when a page tool is used. The only content script declared in the
 // manifests is the small main world console buffer.
 export const PAGE_INJECTION = Object.freeze({
-	js: Object.freeze(["content/content.js"]),
+	js: Object.freeze(["content/md.js", "content/ai-context.js", "content/ai-bug.js", "content/ai-page.js", "content/ai-readiness.js", "content/content.js"]),
 	css: Object.freeze(["content/overlay.css"]),
 })
 

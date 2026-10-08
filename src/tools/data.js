@@ -1,4 +1,5 @@
-import { ToolError, pick, required, seededRandom } from "../lib/utils.js"
+import { ToolError, required } from "../lib/utils.js"
+import { MOCK_TYPES, generateMockRecords, recordsToSql } from "./mock.js"
 import { parseJsonWithDiagnostics } from "./text.js"
 
 const TABLE_ROW_LIMIT = 1000
@@ -227,34 +228,6 @@ export function inspectUrl(input) {
 	return result
 }
 
-const FIRST = ["Ava", "Noah", "Mia", "Liam", "Zoe", "Kai", "Iris", "Omar", "Lena", "Ravi", "Sofía", "Jürgen", "Aiko", "Chloé"]
-const LAST = ["Patel", "Kim", "Silva", "Okafor", "Novak", "Haddad", "Rossi", "Nguyen", "Weber", "Sharma", "O'Brien", "García"]
-const DOMAINS = ["example.com", "test.dev", "mail.local", "acme.io"]
-const CITIES = ["Pune", "Berlin", "Austin", "Lisbon", "Toronto", "Osaka", "São Paulo", "Tallinn"]
-
-function emailPart(text) {
-	return text.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase().replace(/[^a-z0-9]/g, "")
-}
-
-export function mockRecords({ count = 10, seed = "devkit" } = {}) {
-	const random = seededRandom(seed)
-	const total = Math.min(Math.max(Math.floor(Number(count)) || 10, 1), 500)
-	return Array.from({ length: total }, (_, index) => {
-		const first = pick(random, FIRST)
-		const last = pick(random, LAST)
-		return {
-			id: index + 1,
-			name: `${first} ${last}`,
-			email: `${emailPart(first)}.${emailPart(last)}${index + 1}@${pick(random, DOMAINS)}`,
-			phone: `+1-555-${String(Math.floor(random() * 9000) + 1000)}`,
-			city: pick(random, CITIES),
-			age: 18 + Math.floor(random() * 50),
-			active: random() > 0.35,
-			createdAt: new Date(Date.UTC(2024, Math.floor(random() * 12), 1 + Math.floor(random() * 28))).toISOString(),
-		}
-	})
-}
-
 export function shellQuote(value) {
 	return `'${String(value).replace(/'/g, "'\\''")}'`
 }
@@ -401,20 +374,72 @@ export const dataTools = [
 		name: "Mock data generator",
 		category: "Testing",
 		roles: ["qa", "dev"],
-		description: "Deterministic, seedable fake users as JSON, CSV or a table so test runs stay reproducible.",
-		keywords: ["fake", "fixtures", "seed", "test data", "dummy users", "faker"],
+		description: "Seedable fake data from presets or your own schema: 50+ field types, nested objects, nullable fields, templates and patterns. Exports JSON, NDJSON, CSV, SQL or a table.",
+		keywords: ["fake", "fixtures", "seed", "test data", "dummy users", "faker", "schema", "sql insert", "products", "orders"],
 		live: true,
 		inputs: [
-			{ key: "count", label: "Rows", type: "number", default: 10, min: 1, max: 500 },
-			{ key: "seed", label: "Seed", type: "text", default: "devkit", help: "The same seed always produces the same rows." },
-			{ key: "format", label: "Format", type: "select", options: [{ value: "json", label: "JSON" }, { value: "csv", label: "CSV" }, { value: "table", label: "Table" }], default: "json" },
+			{
+				key: "preset",
+				label: "Preset",
+				type: "select",
+				options: [
+					{ value: "users", label: "Users" },
+					{ value: "products", label: "Products" },
+					{ value: "orders", label: "Orders" },
+					{ value: "companies", label: "Companies" },
+					{ value: "employees", label: "Employees" },
+					{ value: "addresses", label: "Addresses" },
+					{ value: "blank", label: "Blank (schema only)" },
+				],
+				default: "users",
+			},
+			{
+				key: "schema",
+				label: "Custom fields",
+				type: "textarea",
+				placeholder: "plan: enum(free|pro|team)\nscore: float(0, 100, 1)\nbio?: sentence\nslug: template({firstName}-{id})\ntags: list(word, 3)\n-age",
+				help: `One "field: type" per line. Adds to the preset, replaces a field with the same name, "-field" removes one, "field?:" is sometimes null, "a.b:" nests. Types: ${MOCK_TYPES.join(", ")}. Pattern: # digit, ? letter, * either.`,
+			},
+			{ key: "count", label: "Rows", type: "number", default: 10, min: 1, max: 5000 },
+			{ key: "seed", label: "Seed", type: "text", default: "sidekick", help: "The same seed and schema always produce the same rows." },
+			{
+				key: "format",
+				label: "Format",
+				type: "select",
+				options: [
+					{ value: "json", label: "JSON" },
+					{ value: "ndjson", label: "NDJSON (one per line)" },
+					{ value: "csv", label: "CSV" },
+					{ value: "sql", label: "SQL INSERT" },
+					{ value: "table", label: "Table" },
+				],
+				default: "json",
+			},
+			{ key: "table", label: "SQL table name", type: "text", default: "mock_data", showIf: { key: "format", in: ["sql"] } },
 		],
-		run: ({ count = 10, seed = "devkit", format = "json" }) => {
-			const records = mockRecords({ count, seed })
-			if (format === "csv") return { type: "text", value: jsonToCsv(records), download: { filename: "mock-data.csv", mime: "text/csv", text: jsonToCsv(records) } }
+		run: ({ preset = "users", schema = "", count = 10, seed = "sidekick", format = "json", table = "mock_data" }) => {
+			const records = generateMockRecords({ preset, schema, count, seed })
+			if (format === "csv") {
+				const csv = jsonToCsv(records)
+				return { type: "text", value: csv, download: { filename: "mock-data.csv", mime: "text/csv", text: csv } }
+			}
+			if (format === "ndjson") {
+				const text = records.map((r) => JSON.stringify(r)).join("\n")
+				return { type: "text", value: text, download: { filename: "mock-data.ndjson", mime: "application/x-ndjson", text } }
+			}
+			if (format === "sql") {
+				const sql = recordsToSql(records, (r) => flattenObject(r), table)
+				return { type: "text", value: sql, download: { filename: "mock-data.sql", mime: "text/plain", text: sql } }
+			}
 			if (format === "table") {
-				const columns = Object.keys(records[0])
-				return { type: "table", value: { columns, rows: records.map((r) => columns.map((c) => r[c])) } }
+				const flat = records.map((r) => flattenObject(r))
+				const columns = [...new Set(flat.flatMap((r) => Object.keys(r)))]
+				const cell = (v) => (v !== null && typeof v === "object" ? JSON.stringify(v) : v)
+				return {
+					type: "table",
+					value: { columns, rows: flat.slice(0, TABLE_ROW_LIMIT).map((r) => columns.map((c) => cell(r[c]))) },
+					download: { filename: "mock-data.json", mime: "application/json", text: JSON.stringify(records, null, 2) },
+				}
 			}
 			return { type: "json", value: records }
 		},

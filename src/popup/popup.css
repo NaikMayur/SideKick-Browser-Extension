@@ -605,7 +605,7 @@ body.app {
 }
 
 .tab {
-	flex: 1;
+	flex: 1 1 auto;
 	min-height: 26px;
 	padding: 3px 6px;
 	border: 1px solid transparent;
@@ -1218,12 +1218,24 @@ body.app {
 	height: 13px;
 }
 
-#run.is-busy .i {
-	animation: spin 0.8s linear infinite;
+#run.is-busy {
+	cursor: progress;
 }
 
-#run.is-busy use {
-	opacity: 0.6;
+#run.is-busy .i {
+	display: none;
+}
+
+#run.is-busy::before {
+	content: "";
+	flex: none;
+	box-sizing: border-box;
+	width: 13px;
+	height: 13px;
+	border: 2px solid currentColor;
+	border-right-color: transparent;
+	border-radius: 50%;
+	animation: spin 0.7s linear infinite;
 }
 
 @keyframes spin {

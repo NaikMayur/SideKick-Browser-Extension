@@ -9,6 +9,7 @@ export const UPLOAD_MAX_BYTES = 25 * 1024 * 1024
 export const SETTINGS_KEYS = ["theme", "role", "pinned", "history", "drafts", "liveRun", "snippets"]
 
 export const CATEGORY_META = {
+	AI: { icon: "sparkle", hue: "#a855f7" },
 	"On page": { icon: "cursor", hue: "#ff5a1f" },
 	Encoding: { icon: "binary", hue: "#8b5cf6" },
 	"Text & data": { icon: "file-text", hue: "#14b8a6" },
@@ -23,6 +24,11 @@ export const CATEGORY_META = {
 const FALLBACK_META = { icon: "layers", hue: "#a89f90" }
 
 const TOOL_ICONS = {
+	"ai-bug-capture": "bug",
+	"privacy-scrubber": "shield",
+	"page-to-ai": "file-text",
+	"ai-readiness": "search",
+	"ai-chat-handoff": "repeat",
 	"image-converter": "image",
 	"snipping-tool": "scissors",
 	"inspect-element": "inspect",
@@ -130,6 +136,7 @@ export function isPageTool(tool) {
 }
 
 export function filterByTab(list, tab) {
+	if (tab === "ai") return list.filter((tool) => tool.category === "AI")
 	if (tab === "page") return list.filter(isPageTool)
 	if (tab === "utils") return list.filter((tool) => !isPageTool(tool))
 	return list
@@ -137,7 +144,7 @@ export function filterByTab(list, tab) {
 
 export function countByTab(list) {
 	const page = list.filter(isPageTool).length
-	return { all: list.length, page, utils: list.length - page }
+	return { all: list.length, ai: list.filter((tool) => tool.category === "AI").length, page, utils: list.length - page }
 }
 
 export function splitPinned(list, pinnedIds) {
@@ -387,8 +394,8 @@ export function isContractResult(data) {
 
 export function normalizeResult(data) {
 	if (isContractResult(data)) {
-		const { type, value, copy, download } = data
-		return { type, value, copy, download }
+		const { type, value, copy, download, meta, note } = data
+		return { type, value, copy, download, meta, note }
 	}
 	if (data === undefined || data === null) return { type: "text", value: "Done", legacy: true }
 	if (typeof data === "string") return { type: "text", value: data, legacy: true }

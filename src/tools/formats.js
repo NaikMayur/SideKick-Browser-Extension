@@ -1134,7 +1134,7 @@ export function renderMarkdownInline(source, holds = [], nested = false) {
 }
 
 const MD_FENCE = /^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)[^`]*$/
-const MD_HEADING = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/
+const MD_HEADING = /^ {0,3}(#{1,6})(?:(?:[ \t]+|(?=[^\s#\d]))(.*?))?(?:[ \t]+#+)?[ \t]*$/
 const MD_HR = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/
 const MD_QUOTE = /^ {0,3}>/
 const MD_LIST_ITEM = /^( {0,3})([-*+]|\d{1,9}[.)])([ \t]+|$)(.*)$/
@@ -1351,7 +1351,7 @@ export function markdownPreview(text) {
 	const source = required(text, "Markdown")
 	if (source.length > 1000000) throw new ToolError("Markdown input is larger than 1 MB; split it into smaller parts")
 	const fragment = renderMarkdown(source)
-	const title = escapeHtml(source.match(/^ {0,3}#{1,6}[ \t]+(.+)$/m)?.[1]?.replace(/[#*_`]/g, "").trim() || "Markdown preview")
+	const title = escapeHtml(source.match(/^ {0,3}#{1,6}(?:[ \t]+|(?=[^\s#\d]))(.+)$/m)?.[1]?.replace(/[#*_`]/g, "").trim() || "Markdown preview")
 	const html = `<!doctype html>\n<html><head><meta charset="utf-8"><title>${title}</title><style>\n${MARKDOWN_CSS}\n</style></head>\n<body>\n${fragment}\n</body></html>\n`
 	return { type: "html-preview", value: { html, source: fragment }, copy: fragment, download: { filename: "markdown.html", mime: "text/html", text: html } }
 }

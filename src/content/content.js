@@ -4248,7 +4248,7 @@
 		}, { limit: 8000, ms: 100 }))
 	}
 
-	let lastGeneratedPassword = ""
+	let formPersona = null
 	let formStepObserver = null
 
 	function isVisibleField(el) {
@@ -4276,193 +4276,229 @@
 		return rect.width > 0 && rect.height > 0
 	}
 
+	function deepQueryAll(selector, root = document, out = []) {
+		out.push(...root.querySelectorAll(selector))
+		for (const host of root.querySelectorAll("*")) {
+			if (host.shadowRoot && !isDevKitNode(host)) deepQueryAll(selector, host.shadowRoot, out)
+		}
+		return out
+	}
+
+	function fieldLabelText(field) {
+		const parts = []
+		const scope = field.getRootNode?.() instanceof ShadowRoot ? field.getRootNode() : document
+		if (field.id) {
+			try {
+				const labelEl = scope.querySelector(`label[for="${CSS.escape(field.id)}"]`)
+				if (labelEl) parts.push(labelEl.textContent || "")
+			} catch {  }
+		}
+		const parentLabel = field.closest("label")
+		if (parentLabel) parts.push(parentLabel.textContent || "")
+		for (const ref of (field.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean)) {
+			const node = scope.getElementById?.(ref) || document.getElementById(ref)
+			if (node) parts.push(node.textContent || "")
+		}
+		return parts.join(" ")
+	}
+
 	function classifyField(field) {
 		const tag = field.tagName.toLowerCase()
 		const type = (field.type || "text").toLowerCase()
 		if (tag === "select") return "select"
 		if (tag === "textarea") return "textarea"
-		if (type === "checkbox") return "checkbox"
-		if (type === "radio") return "radio"
-		if (type === "color") return "color"
-		if (type === "range") return "range"
-		if (type === "date") return "date"
-		if (type === "time") return "time"
-		if (type === "datetime-local") return "datetime-local"
-		if (type === "email") return "email"
-		if (type === "password") return "password"
-		if (type === "tel") return "tel"
-		if (type === "number") return "number"
-		if (type === "url") return "url"
-		if (type === "file") return "file"
+		if (["checkbox", "radio", "color", "range", "date", "time", "datetime-local", "month", "week", "password", "tel", "number", "url", "file"].includes(type)) return type
 
-		const id = field.id || ""
-		const name = field.name || ""
-		const placeholder = field.placeholder || ""
-		const aria = field.getAttribute("aria-label") || ""
-		const auto = field.autocomplete || ""
-		let labelText = ""
-		if (id) {
-			try {
-				const labelEl = document.querySelector(`label[for="${CSS.escape(id)}"]`)
-				if (labelEl) labelText = labelEl.textContent || ""
-			} catch {  }
-		}
-		if (!labelText) {
-			const parentLabel = field.closest("label")
-			if (parentLabel) labelText = parentLabel.textContent || ""
-		}
+		const s = `${field.name || ""} ${field.id || ""} ${field.placeholder || ""} ${field.getAttribute("aria-label") || ""} ${field.autocomplete || ""} ${fieldLabelText(field)}`.toLowerCase()
+		const word = (w) => new RegExp(`(?<![a-z])${w}(?![a-z])`).test(s)
 
-		const s = `${name} ${id} ${placeholder} ${aria} ${auto} ${labelText}`.toLowerCase()
-
-		if (/email|e-mail|mail/i.test(s)) return "email"
-		if (/confirm.*pass|pass.*confirm|repeat.*pass/i.test(s)) return "confirm-password"
-		if (/password|pwd|passcode|secret/i.test(s)) return "password"
-		if (/phone|\btel\b|mobile|cell/i.test(s)) return "tel"
-		if (/first.*name|fname|given.*name/i.test(s)) return "first-name"
-		if (/last.*name|lname|surname|family.*name/i.test(s)) return "last-name"
-		if (/full.*name|your.*name|^name$/i.test(s)) return "full-name"
-		if (/user.*name|login|handle/i.test(s)) return "username"
-		if (/street|address.*1|addr.*1|address/i.test(s)) return "address"
-		if (/apt|suite|unit|flat|address.*2/i.test(s)) return "suite"
-		if (/city|town|municipality/i.test(s)) return "city"
-		if (/state|province|region/i.test(s)) return "state"
-		if (/zip|postal|postcode|pincode/i.test(s)) return "zip"
-		if (/country/i.test(s)) return "country"
-		if (/company|organization|org|business|employer/i.test(s)) return "company"
-		if (/job|title|position|role/i.test(s)) return "job-title"
-		if (/card.*num|cc.*num|credit.*card/i.test(s)) return "credit-card"
-		if (/expir|cc.*exp/i.test(s)) return "card-expiry"
-		if (/cvv|cvc|security.*code/i.test(s)) return "card-cvv"
-		if (/birth|dob|bday/i.test(s)) return "dob"
-		if (/date/i.test(s)) return "date"
-		if (/time/i.test(s)) return "time"
-		if (/website|url|web|domain|link/i.test(s)) return "url"
-		if (/age/i.test(s)) return "age"
-		if (/qty|quantity|amount|count/i.test(s)) return "quantity"
-		if (/price|salary|budget|cost|rate|fee/i.test(s)) return "price"
-		if (/comment|bio|desc|message|note|feedback|review|about/i.test(s)) return "textarea"
-		if (/search|query/i.test(s)) return "search"
+		if (/confirm.*mail|mail.*confirm|repeat.*mail|verify.*mail|re-?enter.*mail/.test(s)) return "confirm-email"
+		if (type === "email" || /e-?mail/.test(s)) return "email"
+		if (/confirm.*pass|pass.*confirm|repeat.*pass/.test(s)) return "confirm-password"
+		if (/password|pwd|passcode/.test(s)) return "password"
+		if (/phone|mobile|cell/.test(s) || word("tel")) return "tel"
+		if (/first.*name|fname|given.*name/.test(s)) return "first-name"
+		if (/last.*name|lname|surname|family.*name/.test(s)) return "last-name"
+		if (/user.*name|login|handle|nickname/.test(s)) return "username"
+		if (/company|organi[sz]ation|business|employer/.test(s) || word("org")) return "company"
+		if (/full.*name|your.*name/.test(s) || word("name")) return "full-name"
+		if (/apt|suite|address.*2|addr.*2|address.?line.?2/.test(s) || word("unit") || word("flat")) return "suite"
+		if (/street|address|addr/.test(s)) return "address"
+		if (/city|town|municipality/.test(s)) return "city"
+		if (/province|region/.test(s) || word("state")) return "state"
+		if (/zip|postal|postcode|pincode/.test(s)) return "zip"
+		if (/country/.test(s)) return "country"
+		if (/job|position|designation|occupation/.test(s) || word("role")) return "job-title"
+		if (/card.*num|cc.*num|credit.*card|cardnumber/.test(s)) return "credit-card"
+		if (/expir|cc.*exp/.test(s)) return "card-expiry"
+		if (/cvv|cvc|security.*code/.test(s)) return "card-cvv"
+		if (/birth|dob|bday/.test(s)) return "dob"
+		if (word("date")) return "date"
+		if (word("time")) return "time"
+		if (/website|url|domain|link/.test(s) || word("web")) return "url"
+		if (word("age")) return "age"
+		if (/qty|quantity|amount/.test(s) || word("count")) return "quantity"
+		if (/price|salary|budget|cost|fee/.test(s) || word("rate")) return "price"
+		if (/comment|bio|desc|message|note|feedback|review|about/.test(s)) return "textarea"
+		if (/search|query/.test(s)) return "search"
 
 		return "text"
 	}
 
-	function generateRealistic(field, payload) {
-		const category = classifyField(field)
+	const PERSONA_FIRST = ["Alex", "Jordan", "Taylor", "Morgan", "Sam", "Chris", "Casey", "Riley", "Jamie", "Avery", "Priya", "Mateo", "Lena", "Kenji"]
+	const PERSONA_LAST = ["Smith", "Johnson", "Williams", "Brown", "Garcia", "Miller", "Davis", "Wilson", "Anderson", "Patel", "Novak", "Tanaka"]
+	const PERSONA_PLACES = [
+		{ city: "San Francisco", state: "CA", zip: "94105" },
+		{ city: "New York", state: "NY", zip: "10001" },
+		{ city: "Austin", state: "TX", zip: "78701" },
+		{ city: "Seattle", state: "WA", zip: "98101" },
+		{ city: "Chicago", state: "IL", zip: "60601" },
+		{ city: "Boston", state: "MA", zip: "02108" },
+	]
+	const PERSONA_STREETS = ["Market Street", "Oak Avenue", "Maple Drive", "Cedar Lane", "Pine Street", "Lakeview Road"]
+	const PERSONA_COMPANIES = ["Acme Corporation", "Pinnacle Dynamics", "Vertex Solutions", "Apex Quality Systems", "Redstone Industries", "Silverlake Partners"]
+	const PERSONA_JOBS = ["QA Automation Engineer", "Senior Software Developer", "Product Designer", "Security Analyst", "Project Manager"]
+
+	function makePersona() {
 		const rand = (arr) => arr[Math.floor(Math.random() * arr.length)]
 		const num = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min
+		const first = rand(PERSONA_FIRST)
+		const last = rand(PERSONA_LAST)
+		const tag = num(100, 999)
+		const place = rand(PERSONA_PLACES)
+		const birth = new Date(Date.UTC(num(1965, 2002), num(0, 11), num(1, 28)))
+		const expiry = new Date()
+		expiry.setFullYear(expiry.getFullYear() + num(2, 4))
+		return {
+			first,
+			last,
+			full: `${first} ${last}`,
+			email: `${first}.${last}${tag}@example.com`.toLowerCase(),
+			username: `${first}${last}${tag}`.toLowerCase(),
+			password: `Str0ng#Pass${tag}!`,
+			phone: `555${num(100, 999)}${num(1000, 9999)}`,
+			street: `${num(100, 9999)} ${rand(PERSONA_STREETS)}`,
+			suite: `Suite ${num(10, 99)}0`,
+			...place,
+			country: "United States",
+			company: rand(PERSONA_COMPANIES),
+			job: rand(PERSONA_JOBS),
+			dob: birth.toISOString().slice(0, 10),
+			age: String(new Date().getUTCFullYear() - birth.getUTCFullYear()),
+			cardExpiry: `${String(expiry.getMonth() + 1).padStart(2, "0")}/${String(expiry.getFullYear()).slice(-2)}`,
+		}
+	}
+
+	function isoWeek(date) {
+		const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()))
+		d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7))
+		const week = Math.ceil(((d - Date.UTC(d.getUTCFullYear(), 0, 1)) / 86400000 + 1) / 7)
+		return `${d.getUTCFullYear()}-W${String(week).padStart(2, "0")}`
+	}
+
+	function clampToFieldRange(field, value) {
+		if (field.min && value < field.min) return field.min
+		if (field.max && value > field.max) return field.max
+		return value
+	}
+
+	function numberInRange(field, fallbackMin, fallbackMax) {
+		const min = field.min !== "" && Number.isFinite(Number(field.min)) ? Number(field.min) : fallbackMin
+		const max = field.max !== "" && Number.isFinite(Number(field.max)) ? Number(field.max) : Math.max(fallbackMax, min + fallbackMax - fallbackMin)
+		const low = Math.ceil(min)
+		const high = Math.max(low, Math.floor(max))
+		return String(Math.floor(Math.random() * (high - low + 1)) + low)
+	}
+
+	function fitLength(field, value, exact) {
+		const max = field.maxLength
+		if (typeof value !== "string" || !(max > 0)) return value
+		if (value.length > max) return value.slice(0, max)
+		return exact ? value.padEnd(max, "x") : value
+	}
+
+	function generateRealistic(field, payload) {
+		const category = classifyField(field)
+		const p = formPersona || (formPersona = makePersona())
+		const rand = (arr) => arr[Math.floor(Math.random() * arr.length)]
+		const num = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min
+		const today = new Date()
 
 		switch (category) {
-			case "email": {
+			case "email":
+			case "confirm-email": {
 				if (payload?.customEmail && payload.customEmail.includes("@")) {
 					return payload.customEmail.replace("{id}", String(num(100, 999)))
 				}
-				const names = ["alex.tester", "jordan.dev", "sam.qa", "taylor.quality", "casey.eng", "morgan.builder"]
-				const domains = ["example.com", "testcorp.io", "qualitylabs.org"]
-				return `${rand(names)}_${num(100, 999)}@${rand(domains)}`
+				return p.email
 			}
-			case "password": {
-				lastGeneratedPassword = `Str0ng#Pass${num(100, 999)}!`
-				return lastGeneratedPassword
-			}
-			case "confirm-password": {
-				return lastGeneratedPassword || `Str0ng#Pass${num(100, 999)}!`
-			}
-			case "tel": {
-				return `555${num(100, 999)}${num(1000, 9999)}`
-			}
-			case "first-name": {
-				return rand(["Alex", "Jordan", "Taylor", "Morgan", "Sam", "Chris", "Casey", "Riley", "Jamie", "Avery"])
-			}
-			case "last-name": {
-				return rand(["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Wilson", "Anderson"])
-			}
-			case "full-name": {
-				const first = rand(["Alex", "Jordan", "Taylor", "Morgan", "Sam", "Chris", "Casey", "Riley"])
-				const last = rand(["Smith", "Johnson", "Williams", "Brown", "Jones", "Miller", "Davis"])
-				return `${first} ${last}`
-			}
-			case "username": {
-				return `user_qa_${num(1000, 9999)}`
-			}
-			case "address": {
-				return `${num(100, 999)} Market Street`
-			}
-			case "suite": {
-				return `Suite ${num(10, 99)}0`
-			}
-			case "city": {
-				return rand(["San Francisco", "New York", "Austin", "Seattle", "Chicago", "Boston"])
-			}
-			case "state": {
-				return rand(["CA", "NY", "TX", "WA", "IL", "MA"])
-			}
-			case "zip": {
-				return String(num(10001, 99950))
-			}
-			case "country": {
-				return "United States"
-			}
-			case "company": {
-				return rand(["Acme Corporation", "Pinnacle Dynamics", "Vertex Solutions", "Apex Quality Systems", "Redstone Industries", "Silverlake Partners"])
-			}
-			case "job-title": {
-				return rand(["QA Automation Engineer", "Senior Software Developer", "Product Designer", "Security Analyst"])
-			}
-			case "credit-card": {
+			case "password":
+			case "confirm-password":
+				return p.password
+			case "tel":
+				return p.phone
+			case "first-name":
+				return p.first
+			case "last-name":
+				return p.last
+			case "full-name":
+				return p.full
+			case "username":
+				return p.username
+			case "address":
+				return p.street
+			case "suite":
+				return p.suite
+			case "city":
+				return p.city
+			case "state":
+				return p.state
+			case "zip":
+				return p.zip
+			case "country":
+				return p.country
+			case "company":
+				return p.company
+			case "job-title":
+				return p.job
+			case "credit-card":
 				return "4242 4242 4242 4242"
-			}
-			case "card-expiry": {
-				return "12/28"
-			}
-			case "card-cvv": {
+			case "card-expiry":
+				return p.cardExpiry
+			case "card-cvv":
 				return String(num(100, 999))
-			}
-			case "dob": {
-				return `199${num(0, 9)}-0${num(1, 9)}-${num(10, 28)}`
-			}
-			case "date": {
-				return new Date().toISOString().slice(0, 10)
-			}
-			case "time": {
-				return "10:30"
-			}
-			case "datetime-local": {
-				return `${new Date().toISOString().slice(0, 10)}T10:30`
-			}
-			case "url": {
-				return "https://example.com/portfolio"
-			}
-			case "age": {
-				return String(num(22, 58))
-			}
-			case "quantity": {
+			case "dob":
+				return clampToFieldRange(field, p.dob)
+			case "date":
+				return clampToFieldRange(field, today.toISOString().slice(0, 10))
+			case "time":
+				return clampToFieldRange(field, "10:30")
+			case "datetime-local":
+				return clampToFieldRange(field, `${today.toISOString().slice(0, 10)}T10:30`)
+			case "month":
+				return clampToFieldRange(field, today.toISOString().slice(0, 7))
+			case "week":
+				return clampToFieldRange(field, isoWeek(today))
+			case "url":
+				return `https://${p.username}.example.com`
+			case "age":
+				return p.age
+			case "quantity":
 				return String(num(1, 10))
-			}
-			case "price": {
+			case "price":
 				return `${num(25, 450)}.00`
-			}
-			case "number": {
-				const min = Number(field.min) || 1
-				const max = Number(field.max) || 100
-				return String(num(min, Math.min(max, 100)))
-			}
-			case "textarea": {
-				return "Automated test input. Synthetic form data verifying cross-field validation, responsive inputs, and submission stability under standard conditions."
-			}
-			case "file": {
+			case "number":
+				return numberInRange(field, 1, 100)
+			case "range":
+				return numberInRange(field, 0, 100)
+			case "textarea":
+				return `Hi, I'm ${p.full} from ${p.company}. This is synthetic test data for checking validation, layout and submission.`
+			case "file":
 				return "demo-upload.png"
-			}
-			case "color": {
+			case "color":
 				return "#ff5a1f"
-			}
-			case "range": {
-				const min = Number(field.min) || 0
-				const max = Number(field.max) || 100
-				return String(Math.floor((min + max) / 2))
-			}
-			default: {
-				return rand(["Test Sample", "Demo Input", "Standard Data", "Lorem Ipsum", "Quality Check"])
-			}
+			default:
+				return rand(["Test Sample", "Demo Input", "Standard Data", "Quality Check"])
 		}
 	}
 
@@ -4470,20 +4506,31 @@
 		const category = classifyField(field)
 		switch (category) {
 			case "email":
-				return `qa+boundary.test_${Date.now()}@subdomain.testing-domain.co.uk`
+			case "confirm-email":
+				return `qa+boundary.test_${formPersona?.username || "user"}@subdomain.testing-domain.co.uk`
 			case "password":
 			case "confirm-password":
 				return `VeryL0ngP@ssw0rd!#$2026_WithSpecialChars_&_Unicode_🚀`
 			case "tel":
 				return `+19999999999`
 			case "number":
+			case "range":
+				return field.max !== "" && Number.isFinite(Number(field.max)) ? String(field.max) : "999999"
 			case "age":
 			case "quantity":
 			case "price":
 				return "999999"
 			case "date":
 			case "dob":
-				return "2099-12-31"
+				return field.max || "2099-12-31"
+			case "month":
+				return field.max || "2099-12"
+			case "week":
+				return field.max || "2099-W52"
+			case "time":
+				return field.max || "23:59"
+			case "datetime-local":
+				return field.max || "2099-12-31T23:59"
 			case "url":
 				return "https://sub.domain.example.com/path?query=1&test=true#hash-anchor"
 			case "textarea":
@@ -4545,6 +4592,10 @@
 		} else if (type === "radio") {
 			if (!field.checked) field.click()
 			field.dispatchEvent(new Event("change", { bubbles: true, composed: true }))
+		} else if (tag === "select" && field.multiple) {
+			const choices = [...field.options].filter((opt) => !opt.disabled && opt.value !== "" && !/^(select|choose|please|pick|--)/i.test((opt.text || "").trim()))
+			const wanted = new Set([...choices].sort(() => Math.random() - 0.5).slice(0, Math.min(choices.length, 1 + Math.floor(Math.random() * 3))))
+			for (const opt of field.options) opt.selected = wanted.has(opt)
 		} else if (tag === "select") {
 
 			const validOptions = [...field.options].filter((opt) => {
@@ -4576,7 +4627,17 @@
 				field.files = dt.files
 			} catch {  }
 		} else if (field.isContentEditable) {
-			field.textContent = String(value)
+			field.focus()
+			const range = document.createRange()
+			range.selectNodeContents(field)
+			const selection = window.getSelection()
+			selection.removeAllRanges()
+			selection.addRange(range)
+			let typed = false
+			try {
+				typed = document.execCommand("insertText", false, String(value))
+			} catch {  }
+			if (!typed || !(field.textContent || "").includes(String(value).slice(0, 20))) field.textContent = String(value)
 		} else if (type === "date" || type === "time" || type === "datetime-local") {
 
 			const proto = Object.getPrototypeOf(field)
@@ -4634,7 +4695,6 @@
 
 	function findNextButton() {
 		const candidates = [...document.querySelectorAll("button, input[type='button'], input[type='submit'], [role='button'], a.btn")]
-		let fallback = null
 		for (const btn of candidates) {
 			if (!isVisibleField(btn)) continue
 			const txt = (btn.textContent || btn.value || "").trim().toLowerCase()
@@ -4647,11 +4707,8 @@
 			) {
 				return btn
 			}
-			if (btn.type === "submit" || /submit|register|sign up|create/i.test(txt)) {
-				if (!fallback) fallback = btn
-			}
 		}
-		return fallback
+		return null
 	}
 
 	let formRunId = 0
@@ -5182,14 +5239,59 @@
 		return count
 	}
 
+	const CONSENT_TEXT = /agree|terms|accept|consent|privacy|policy|acknowledg|confirm|i have read|i understand/i
+
+	function shouldTickSingle(field) {
+		if (field.required || field.getAttribute("aria-required") === "true") return true
+		if (CONSENT_TEXT.test(`${field.name || ""} ${field.id || ""} ${fieldLabelText(field)}`)) return true
+		return Math.random() < 0.5
+	}
+
+	function choiceGroup(field, visible) {
+		if (!field.name) return [field]
+		return visible.filter((other) => other.type === field.type && other.name === field.name && other.form === field.form)
+	}
+
+	function displayValue(field, fallback) {
+		if (field.tagName === "SELECT") return [...field.selectedOptions].map((o) => (o.text || o.value).trim()).join(", ")
+		if (field.type === "checkbox" || field.type === "radio") return fieldLabelText(field).trim().replace(/\s+/g, " ") || field.value || "checked"
+		if (field.type === "file") return field.files?.[0]?.name || String(fallback)
+		return String(fallback)
+	}
+
+	async function fillSliders(isClear, filledList) {
+		let count = 0
+		const sliders = deepQueryAll('[role="slider"]').filter((el) => !isDevKitNode(el)).filter(isVisibleField)
+		for (const slider of sliders) {
+			if (slider.getAttribute("data-dk-filled")) continue
+			slider.focus?.()
+			const press = (key) => {
+				slider.dispatchEvent(new KeyboardEvent("keydown", { key, code: key, bubbles: true, cancelable: true }))
+				slider.dispatchEvent(new KeyboardEvent("keyup", { key, code: key, bubbles: true, cancelable: true }))
+			}
+			press("Home")
+			if (!isClear) for (let i = 0, n = 1 + Math.floor(Math.random() * 8); i < n; i++) press("ArrowRight")
+			await new Promise((r) => setTimeout(r, 30))
+			slider.setAttribute("data-dk-filled", "true")
+			highlightField(slider)
+			count++
+			filledList.push({
+				field: (slider.getAttribute("aria-label") || fieldLabelText(slider).trim() || "Slider").slice(0, 40),
+				type: "slider",
+				value: slider.getAttribute("aria-valuetext") || slider.getAttribute("aria-valuenow") || "",
+			})
+		}
+		return count
+	}
+
 	function fillCurrentVisible(isClear, isEdgeCase, payload, filledList) {
-		const allInputs = [
-			...document.querySelectorAll("input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='reset']):not([role='combobox']), textarea, select, [contenteditable='true']")
-		]
+		const allInputs = deepQueryAll("input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='reset']):not([type='image']):not([role='combobox']), textarea, select, [contenteditable='true'], [contenteditable='plaintext-only']")
 			.filter(el => !isDevKitNode(el))
+			.filter(el => !el.parentElement?.closest("[contenteditable='true']"))
 		const visible = allInputs.filter(isVisibleField)
 		let count = 0
-		const radioGroups = new Set()
+		const handledGroups = new Set()
+		const label = (field) => (field.getAttribute("aria-label") || fieldLabelText(field).trim().replace(/\s+/g, " ") || field.name || field.id || field.tagName.toLowerCase()).slice(0, 40)
 
 		for (const field of visible) {
 			if (isClear) {
@@ -5200,19 +5302,42 @@
 			}
 			if (field.getAttribute("data-dk-filled")) continue
 
-			if (field.type === "radio") {
-				if (radioGroups.has(field.name)) continue
-				radioGroups.add(field.name)
+			if (field.type === "radio" || field.type === "checkbox") {
+				const group = choiceGroup(field, visible)
+				if (field.type === "radio" || group.length > 1) {
+					if (handledGroups.has(group[0])) continue
+					handledGroups.add(group[0])
+					const available = group.filter((g) => !g.disabled)
+					let picks
+					if (field.type === "radio") picks = [available[Math.floor(Math.random() * available.length)]]
+					else {
+						const required = available.filter((g) => g.required || CONSENT_TEXT.test(fieldLabelText(g)))
+						const extra = available.filter((g) => !required.includes(g)).sort(() => Math.random() - 0.5).slice(0, Math.min(available.length, 1 + Math.floor(Math.random() * 3)))
+						picks = [...new Set([...required, ...extra])]
+					}
+					for (const choice of picks.filter(Boolean)) {
+						setFieldValue(choice, true)
+						highlightField(choice)
+						count++
+						filledList.push({ field: field.name || label(choice), type: field.type === "radio" ? "radio group" : "checkbox group", value: displayValue(choice, "checked").slice(0, 35) })
+					}
+					group.forEach((g) => g.setAttribute("data-dk-filled", "true"))
+					continue
+				}
+				field.setAttribute("data-dk-filled", "true")
+				if (!shouldTickSingle(field)) continue
 			}
-			const val = isEdgeCase ? generateEdgeCase(field) : generateRealistic(field, payload)
+
+			const raw = isEdgeCase ? generateEdgeCase(field) : generateRealistic(field, payload)
+			const val = fitLength(field, raw, isEdgeCase)
 			setFieldValue(field, val)
 			field.setAttribute("data-dk-filled", "true")
 			highlightField(field)
 			count++
 			filledList.push({
-				field: field.name || field.id || field.getAttribute("aria-label") || field.tagName.toLowerCase(),
-				type: field.type || field.tagName.toLowerCase(),
-				value: String(val).slice(0, 35),
+				field: label(field),
+				type: field.tagName === "SELECT" ? (field.multiple ? "multi-select" : "select") : field.isContentEditable ? "rich text" : field.type || field.tagName.toLowerCase(),
+				value: displayValue(field, val).slice(0, 35),
 			})
 		}
 		return count
@@ -5221,7 +5346,8 @@
 	async function fillFormStep(isClear, isEdgeCase, payload, filledList) {
 		const nativeCount = fillCurrentVisible(isClear, isEdgeCase, payload, filledList)
 		const customCount = await fillCustomSelects(isClear, filledList)
-		return nativeCount + customCount
+		const sliderCount = await fillSliders(isClear, filledList)
+		return nativeCount + customCount + sliderCount
 	}
 
 	async function fillForm(payload = {}) {
@@ -5234,6 +5360,7 @@
 
 		stopFormFiller()
 		ensurePageStyles()
+		formPersona = makePersona()
 		const runId = formRunId
 
 		document.querySelectorAll("[data-dk-filled]").forEach(el => el.removeAttribute("data-dk-filled"))
@@ -5308,6 +5435,118 @@
 				message: `Successfully populated ${totalFilled} fields${currentStep > 1 ? ` across ${currentStep} steps` : ""}. Use Close on the page bar to stop watching.`,
 			},
 		}
+	}
+
+	function pickElement(title, hint) {
+		return new Promise((resolve) => {
+			let done = false
+			const targetOf = (event) => {
+				const node = event.composedPath?.()[0] ?? event.target
+				return node instanceof Element ? node : null
+			}
+			const paint = rafThrottle((node) => {
+				if (!done && node?.isConnected) placeHighlight(node.getBoundingClientRect())
+			})
+			const onPickMove = (event) => {
+				if (isDevKitEvent(event)) return
+				const node = targetOf(event)
+				if (node) paint(node)
+			}
+			const swallow = (event) => {
+				if (isDevKitEvent(event)) return
+				event.preventDefault()
+				event.stopPropagation()
+				event.stopImmediatePropagation()
+			}
+			const finish = (node) => {
+				if (done) return
+				done = true
+				document.removeEventListener("mousemove", onPickMove, true)
+				document.removeEventListener("click", onPickClick, true)
+				document.removeEventListener("keydown", onPickKey, true)
+				for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup"]) document.removeEventListener(type, swallow, true)
+				activeCleanups.delete("ai-pick")
+				if (highlight?.parentNode) highlight.parentNode.removeChild(highlight)
+				highlight = null
+				hideFloatingCta()
+				resolve(node)
+			}
+			const onPickClick = (event) => {
+				if (isDevKitEvent(event)) return
+				const node = targetOf(event)
+				if (!node || isDevKitNode(node)) return
+				swallow(event)
+				finish(node)
+			}
+			const onPickKey = (event) => {
+				if (!isEscapeKey(event)) return
+				event.preventDefault()
+				event.stopPropagation()
+				finish(null)
+			}
+			document.addEventListener("mousemove", onPickMove, true)
+			document.addEventListener("click", onPickClick, true)
+			document.addEventListener("keydown", onPickKey, true)
+			for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup"]) document.addEventListener(type, swallow, true)
+			registerCleanup("ai-pick", () => finish(null))
+			showFloatingCta(title, hint, () => finish(null))
+		})
+	}
+
+	async function screenshotElement(node) {
+		if (!node?.isConnected) return null
+		const box = node.getBoundingClientRect()
+		if (box.top < 0 || box.bottom > window.innerHeight || box.left < 0 || box.right > window.innerWidth) {
+			try {
+				node.scrollIntoView({ block: "center", inline: "center", behavior: "instant" })
+			} catch {}
+			await nextFrame()
+		}
+		const rect = node.getBoundingClientRect()
+		const pad = 8
+		const left = Math.max(0, rect.left - pad)
+		const top = Math.max(0, rect.top - pad)
+		const right = Math.min(window.innerWidth, rect.right + pad)
+		const bottom = Math.min(window.innerHeight, rect.bottom + pad)
+		if (right - left < 4 || bottom - top < 4) return null
+		const image = await dataUrlToImageEl(await requestScreenshot())
+		const scale = image.width / window.innerWidth
+		const sx = Math.round(left * scale)
+		const sy = Math.round(top * scale)
+		const sw = Math.min(image.width - sx, Math.round((right - left) * scale))
+		const sh = Math.min(image.height - sy, Math.round((bottom - top) * scale))
+		if (sw < 2 || sh < 2) return null
+		const canvas = document.createElement("canvas")
+		canvas.width = sw
+		canvas.height = sh
+		canvas.getContext("2d").drawImage(image, sx, sy, sw, sh, 0, 0, sw, sh)
+		return { dataUrl: canvas.toDataURL("image/png"), width: sw, height: sh, clipped: rect.height > window.innerHeight || rect.width > window.innerWidth }
+	}
+
+	const aiHelpers = {
+		pickElement,
+		screenshotElement,
+		cssPath,
+		getRecentLogs,
+		pageContext,
+		detectStack: () => {
+			try {
+				return detectStack().detected ?? []
+			} catch {
+				return []
+			}
+		},
+		sendRuntime,
+		screenshot: () => requestScreenshot(),
+		probe: (request, target) => probeMain(request, target),
+		mainWorldCall,
+		isDevKitNode,
+	}
+
+	async function runAiModule(name, payload) {
+		const module = globalThis[name]
+		if (typeof module !== "function") return { ok: false, error: "Reload this tab so Sidekick can attach, then run again." }
+		return module(payload ?? {}, aiHelpers)
 	}
 
 	let snipOverlay = null
@@ -5526,24 +5765,23 @@
 	}
 
 	function findMainScroller() {
-        let best = null
-        let bestArea = 0
-        scanElements("body *", (node) => {
-            if (node.scrollHeight - node.clientHeight < 8 || node.clientHeight < 100) return
-            const overflowY = getComputedStyle(node).overflowY
-            if (overflowY !== "auto" && overflowY !== "scroll" && overflowY !== "overlay") return
-            const rect = node.getBoundingClientRect()
-            const w = Math.min(rect.right, window.innerWidth) - Math.max(rect.left, 0)
-            const h = Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0)
-            if (w <= 0 || h <= 0) return
-            if (w * h > bestArea) {
-                bestArea = w * h
-                best = node
-            }
-        }, { limit: 20000, ms: 400 })
-        return best
-    }
-
+		let best = null
+		let bestArea = 0
+		scanElements("body *", (node) => {
+			if (node.scrollHeight - node.clientHeight < 8 || node.clientHeight < 100) return
+			const overflowY = getComputedStyle(node).overflowY
+			if (overflowY !== "auto" && overflowY !== "scroll" && overflowY !== "overlay") return
+			const rect = node.getBoundingClientRect()
+			const w = Math.min(rect.right, window.innerWidth) - Math.max(rect.left, 0)
+			const h = Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0)
+			if (w <= 0 || h <= 0) return
+			if (w * h > bestArea) {
+				bestArea = w * h
+				best = node
+			}
+		}, { limit: 20000, ms: 400 })
+		return best
+	}
 
 	async function snipFullPage() {
 		const dpr = window.devicePixelRatio || 1
@@ -5557,29 +5795,28 @@
 		)
 		const scroller = docH - viewH > 4 ? null : findMainScroller()
 
-        let clip, fullH, fullW, scrollToY, getY
-        if (scroller) {
-            const rect = scroller.getBoundingClientRect()
-            const left = Math.max(rect.left + scroller.clientLeft, 0)
-            const top = Math.max(rect.top + scroller.clientTop, 0)
-            const right = Math.min(rect.left + scroller.clientLeft + scroller.clientWidth, viewW)
-            const bottom = Math.min(rect.top + scroller.clientTop + scroller.clientHeight, viewH)
-            clip = { left, top, width: right - left, height: bottom - top }
-            fullH = scroller.scrollHeight
-            fullW = clip.width
-            scrollToY = (y) => { scroller.scrollTop = y }
-            getY = () => scroller.scrollTop
-        } else {
-            clip = { left: 0, top: 0, width: viewW, height: viewH }
-            fullH = docH
-            fullW = Math.max(
-                document.body.scrollWidth,
-                document.documentElement.scrollWidth
-            )
-            scrollToY = (y) => window.scrollTo({ left: 0, top: y, behavior: "instant" })
-            getY = () => window.scrollY
-        }
-
+		let clip, fullH, fullW, scrollToY, getY
+		if (scroller) {
+			const rect = scroller.getBoundingClientRect()
+			const left = Math.max(rect.left + scroller.clientLeft, 0)
+			const top = Math.max(rect.top + scroller.clientTop, 0)
+			const right = Math.min(rect.left + scroller.clientLeft + scroller.clientWidth, viewW)
+			const bottom = Math.min(rect.top + scroller.clientTop + scroller.clientHeight, viewH)
+			clip = { left, top, width: right - left, height: bottom - top }
+			fullH = scroller.scrollHeight
+			fullW = clip.width
+			scrollToY = (y) => { scroller.scrollTop = y }
+			getY = () => scroller.scrollTop
+		} else {
+			clip = { left: 0, top: 0, width: viewW, height: viewH }
+			fullH = docH
+			fullW = Math.max(
+				document.body.scrollWidth,
+				document.documentElement.scrollWidth
+			)
+			scrollToY = (y) => window.scrollTo({ left: 0, top: y, behavior: "instant" })
+			getY = () => window.scrollY
+		}
 		// Browsers cap canvas size (about 32k px per side), so very long pages are truncated.
 		const maxCssHeight = Math.floor(32000 / dpr)
 		const truncated = fullH > maxCssHeight
@@ -5607,9 +5844,9 @@
 		scanElements("body *", (node) => {
 			const pos = getComputedStyle(node).position
 			if ((pos === "fixed" || pos === "sticky") && !(scroller && node.contains(scroller))) {
-                fixedEls.push({ node, orig: node.style.cssText })
-            }
-        }, { limit: 20000, ms: 400 })
+				fixedEls.push({ node, orig: node.style.cssText })
+			}
+		}, { limit: 20000, ms: 400 })
 		const hideFixed = () => {
 			for (const { node } of fixedEls) node.style.setProperty("visibility", "hidden", "important")
 		}
@@ -5631,7 +5868,7 @@
 				if (cancelled) break
 
 				if (i === 1) hideFixed()
-				window.scrollTo({ left: 0, top: i * viewH, behavior: "instant" })
+				scrollToY(i * clip.height)
 
 				await new Promise(r => setTimeout(r, 200))
 
@@ -5649,25 +5886,24 @@
 				const img = await dataUrlToImageEl(dataUrl)
 				if (cancelled) break
 
-	                const yOffset = getY() * dpr
-                const drawH = Math.min(clip.height * dpr, canvas.height - yOffset)
-                const srcX = scroller ? Math.round(clip.left * dpr) : 0
-                const srcW = scroller ? canvas.width : img.width
+				const yOffset = getY() * dpr
+				const drawH = Math.min(clip.height * dpr, canvas.height - yOffset)
+				const srcX = scroller ? Math.round(clip.left * dpr) : 0
+				const srcW = scroller ? canvas.width : img.width
 
+				ctx.drawImage(
+					img,
+					srcX, Math.round(clip.top * dpr), srcW, Math.round(drawH),
+					0, Math.round(yOffset), srcW, Math.round(drawH)
+				)
+			}
+		} finally {
+			window.removeEventListener("keydown", onKey, true)
+			document.removeEventListener("keydown", onKey, true)
+			activeSnipCancel = null
 
-                ctx.drawImage(
-                    img,
-                    srcX, Math.round(clip.top * dpr), srcW, Math.round(drawH),
-                    0, Math.round(yOffset), srcW, Math.round(drawH)
-                )
-            }
-        } finally {
-            window.removeEventListener("keydown", onKey, true)
-            document.removeEventListener("keydown", onKey, true)
-            activeSnipCancel = null
-
-            if (scroller) scroller.scrollTop = savedScrollerY
-            window.scrollTo({ left: savedX, top: savedY, behavior: "instant" })
+			if (scroller) scroller.scrollTop = savedScrollerY
+			window.scrollTo({ left: savedX, top: savedY, behavior: "instant" })
 			for (const { node, orig } of fixedEls) {
 				node.style.cssText = orig
 			}
@@ -6114,6 +6350,16 @@
 		"deep-inspect": () => ({ ok: true, data: { enabled: setInspect() } }),
 		"scan-animations": () => ({ ok: true, data: scanAnimations() }),
 		"fill-form": (payload) => fillForm(payload),
+		"ai-bug-capture": (payload) => runAiModule("__sidekickAiBug", payload),
+		"page-to-ai": (payload) => runAiModule("__sidekickAiPage", payload),
+		"ai-readiness": (payload) => runAiModule("__sidekickAiReadiness", payload),
+		"ai-context": async (payload) => {
+			const module = globalThis.__sidekickAiContext
+			if (!module) return { ok: false, error: "Reload this tab so Sidekick can attach, then run again." }
+			const result = await module.run(payload)
+			if (result.ok && result.note) showFloatingCta("Sidekick: AI chat handoff", result.note, () => hideFloatingCta())
+			return result
+		},
 		snip: (payload) => handleSnip(payload),
 		"stop-tool": () => stopAllActiveTools(),
 		"toggle-measure": () => ({ ok: true, data: { enabled: toggleMeasure() } }),

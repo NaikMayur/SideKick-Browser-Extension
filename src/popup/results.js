@@ -242,6 +242,7 @@ function rawFor(result) {
 }
 
 function metaFor(result) {
+	if (typeof result.meta === "string" && result.meta) return result.meta
 	if (result.type === "table") return `${result.value?.rows?.length ?? 0} rows`
 	if (result.type === "image") return `${result.value?.width ?? "?"}×${result.value?.height ?? "?"}`
 	const text = resultToText(result)
@@ -272,6 +273,7 @@ export function renderResult(container, result, ctx = {}) {
 	const head = el("div", "result-head")
 	head.append(el("span", "eyebrow", "Output"), el("span", "tag", TYPE_LABELS[result.type] ?? result.type), el("span", "result-meta", metaFor(result)))
 	card.appendChild(head)
+	if (typeof result.note === "string" && result.note) card.appendChild(el("p", "result-note", result.note))
 
 	let visual = null
 	try {

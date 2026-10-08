@@ -1,4 +1,5 @@
 import { api, isExtension } from "../lib/browser.js"
+import { clearDrafts, readDrafts, wipeEverything, writeDrafts } from "../lib/vault.js"
 import { ROLES, categories, tools } from "../lib/registry.js"
 import { applyTheme, downloadFile, el, icon } from "../popup/dom.js"
 import { SETTINGS_KEYS, categoryMeta, iconForTool, validateSettings } from "../popup/helpers.js"
@@ -56,10 +57,11 @@ function bindTheme() {
 }
 
 async function refreshCounts() {
-	const saved = await storageGet(["pinned", "history", "drafts"])
+	const saved = await storageGet(["pinned", "history"])
+	const drafts = isExtension ? await readDrafts().catch(() => ({})) : {}
 	$("count-pinned").textContent = String(Array.isArray(saved.pinned) ? saved.pinned.length : 0)
 	$("count-history").textContent = String(Array.isArray(saved.history) ? saved.history.length : 0)
-	$("count-drafts").textContent = String(saved.drafts && typeof saved.drafts === "object" ? Object.keys(saved.drafts).length : 0)
+	$("count-drafts").textContent = String(Object.keys(drafts).length)
 }
 
 function bindClear(id, key, empty, label) {
@@ -71,10 +73,11 @@ function bindClear(id, key, empty, label) {
 }
 
 async function exportSettings() {
-	const saved = await storageGet(SETTINGS_KEYS)
-	const data = Object.fromEntries(SETTINGS_KEYS.filter((key) => saved[key] !== undefined).map((key) => [key, saved[key]]))
+	const keys = SETTINGS_KEYS.filter((key) => key !== "drafts")
+	const saved = await storageGet(keys)
+	const data = Object.fromEntries(keys.filter((key) => saved[key] !== undefined).map((key) => [key, saved[key]]))
 	downloadFile({ filename: "sidekick-settings.json", mime: "application/json", text: JSON.stringify(data, null, 2) })
-	notice("data-notice", "Exported sidekick-settings.json", "good")
+	notice("data-notice", "Exported sidekick-settings.json. Drafts stay encrypted on this device and are not exported.", "good")
 }
 
 async function importSettings(file) {
@@ -90,7 +93,9 @@ async function importSettings(file) {
 		notice("data-notice", `Nothing imported. ${errors.join("; ")}`, "bad")
 		return
 	}
-	await storageSet(values)
+	const { drafts, ...plain } = values
+	if (drafts && isExtension) await writeDrafts({ ...(await readDrafts().catch(() => ({}))), ...drafts })
+	await storageSet(plain)
 	await loadPreferences()
 	await refreshCounts()
 	const imported = Object.keys(values).join(", ")
@@ -152,7 +157,11 @@ async function init() {
 
 	bindClear("clear-pinned", "pinned", [], "Pins")
 	bindClear("clear-history", "history", [], "History")
-	bindClear("clear-drafts", "drafts", {}, "Drafts")
+	$("clear-drafts").addEventListener("click", async () => {
+		if (isExtension) await clearDrafts().catch(() => {})
+		await refreshCounts()
+		notice("data-notice", "Drafts cleared.", "good")
+	})
 	$("export").addEventListener("click", exportSettings)
 	$("import").addEventListener("click", () => $("import-file").click())
 	$("import-file").addEventListener("change", (event) => {
@@ -162,10 +171,10 @@ async function init() {
 	})
 	$("clear").addEventListener("click", async () => {
 		if (!confirm("Reset all Sidekick settings, pins, drafts and history?")) return
-		if (isExtension) await api.storage.clear().catch(() => {})
+		if (isExtension) await wipeEverything().catch(() => {})
 		await loadPreferences()
 		await refreshCounts()
-		notice("data-notice", "All local data cleared.", "good")
+		notice("data-notice", "All local data cleared and the encryption keys destroyed.", "good")
 	})
 	api.raw?.storage?.onChanged?.addListener(() => refreshCounts())
 }

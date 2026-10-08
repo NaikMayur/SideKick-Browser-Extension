@@ -1,4 +1,5 @@
 import { api, isExtension, sendToPage } from "../lib/browser.js"
+import { readDrafts, writeDrafts } from "../lib/vault.js"
 import { ROLES, getTool, searchTools, tools } from "../lib/registry.js"
 import { applyTheme, copyText, debounce, downloadFile, el, icon, setIcon, toast } from "./dom.js"
 import { buildForm } from "./form.js"
@@ -223,7 +224,7 @@ function onStorageChanged(changes, area) {
 	}
 	if (changes.theme && changes.theme.newValue !== root.dataset.themeMode) setTheme(changes.theme.newValue ?? "system", false)
 	if (changes.liveRun) state.liveRun = changes.liveRun.newValue !== false
-	if (changes.drafts && !changes.drafts.newValue) state.drafts = {}
+	if ((changes.drafts && !changes.drafts.newValue) || (changes["vault:drafts"] && !changes["vault:drafts"].newValue)) state.drafts = {}
 }
 
 function onRuntimeMessage(message) {
@@ -256,7 +257,7 @@ function currentVisible() {
 	return filterByTab(currentMatches(), state.tab)
 }
 
-const TAB_HEADINGS = { all: "All tools", page: "On this page", utils: "Utilities" }
+const TAB_HEADINGS = { all: "All tools", ai: "AI tools", page: "On this page", utils: "Utilities" }
 
 function renderList({ keepCursor = false } = {}) {
 	const query = ui.search.value.trim()
@@ -416,8 +417,7 @@ function onGlobalKeys(event) {
 
 async function loadDrafts() {
 	if (state.drafts) return state.drafts
-	const saved = isExtension ? await api.storage.get("drafts").catch(() => ({})) : {}
-	state.drafts = saved.drafts && typeof saved.drafts === "object" ? saved.drafts : {}
+	state.drafts = isExtension ? await readDrafts().catch(() => ({})) : {}
 	return state.drafts
 }
 
@@ -520,7 +520,7 @@ function saveDraft() {
 	const had = Boolean(state.drafts[state.current.id])
 	if (!draft && !had) return
 	state.drafts = mergeDraft(state.drafts, state.current.id, draft)
-	persist({ drafts: state.drafts })
+	if (isExtension) writeDrafts(state.drafts).catch(() => {})
 }
 
 function setRunning(running) {
@@ -595,7 +595,8 @@ async function runPageTool(tool) {
 	if (!response?.ok) throw pageError(response?.error)
 	afterPageRun(tool, response.data)
 	if (tool.id === "viewport-resize") state.viewportSig = viewportSig(response.data)
-	return normalizeResult(response.data ?? "Done")
+	const data = typeof tool.finish === "function" ? await tool.finish(response.data, values) : response.data
+	return normalizeResult(data ?? "Done")
 }
 
 function afterPageRun(tool, data) {
